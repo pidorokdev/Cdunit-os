@@ -15,6 +15,8 @@
 #include "toolbar_icons.h" /* Toolbar icons for image viewer */
 #include "types.h"
 
+extern uint64_t arch_timer_get_ms(void);
+
 struct window *gui_create_file_manager(int x, int y);
 void gui_open_notepad(const char *path);
 
@@ -887,6 +889,7 @@ static void draw_icon(int x, int y, int size, const unsigned char *icon,
 struct fm_state {
   char path[256];
   char selected[256];
+  uint64_t last_click_ms;
   int scroll_y;
 };
 
@@ -938,6 +941,7 @@ struct find_ctx {
   int cur_slot;
   struct fm_state *st;
   int clicked;
+  int was_selected;
   int click_x, click_y;
   int slot_w, slot_h;
   int win_w;
@@ -947,6 +951,7 @@ static int find_callback(void *ctx, const char *name, int len, loff_t off,
                          ino_t ino, unsigned type) {
   (void)off;
   (void)ino;
+  (void)type;
   struct find_ctx *fc = (struct find_ctx *)ctx;
   if (fc->clicked)
     return 0;
@@ -960,30 +965,13 @@ static int find_callback(void *ctx, const char *name, int len, loff_t off,
 
     /* HIT! */
     fc->clicked = 1;
+    fc->was_selected = (str_cmp(fc->st->selected, name) == 0);
 
     /* Handle selection */
     int i;
     for (i = 0; i < len && i < 255; i++)
       fc->st->selected[i] = name[i];
     fc->st->selected[i] = '\0';
-
-    /* Handle Double Click (Primitive: if already selected, enter) */
-    if (type == 4) { /* Directory */
-      /* Append path */
-      int plen = 0;
-      while (fc->st->path[plen])
-        plen++;
-      /* Check if path ends in / */
-      int need_slash = (plen > 0 && fc->st->path[plen - 1] != '/');
-      if (plen + len + need_slash + 1 < 256) {
-        if (need_slash)
-          fc->st->path[plen++] = '/';
-        for (i = 0; i < len; i++)
-          fc->st->path[plen++] = name[i];
-        fc->st->path[plen] = '\0';
-        fc->st->selected[0] = '\0';
-      }
-    }
     return 1; /* Stop */
   }
 
@@ -1053,7 +1041,9 @@ static int fm_render_callback(void *ctx, const char *name, int len,
       bmp = icon_notepad;
       color = 0xFFFFFF;
     } else if (str_ends_with_ci(name, ".jpg") ||
-               str_ends_with_ci(name, ".jpeg")) {
+               str_ends_with_ci(name, ".jpeg") ||
+               str_ends_with_ci(name, ".png") ||
+               str_ends_with_ci(name, ".bmp")) {
       color = 0xF9E2AF;
     } else if (str_ends_with_ci(name, ".mp3")) {
       color = 0xA6E3A1;
@@ -1241,6 +1231,7 @@ static void fm_on_mouse(struct window *win, int x, int y, int buttons) {
   fctx.start_x = content_x;
   fctx.st = st;
   fctx.clicked = 0;
+  fctx.was_selected = 0;
   fctx.click_x = x;
   fctx.click_y = y;
 
@@ -1260,6 +1251,15 @@ static void fm_on_mouse(struct window *win, int x, int y, int buttons) {
   vfs_close(dir);
 
   if (fctx.clicked) {
+    uint64_t now = arch_timer_get_ms();
+    int is_double_click =
+        fctx.was_selected && st->last_click_ms && now >= st->last_click_ms &&
+        (now - st->last_click_ms) <= 500;
+    st->last_click_ms = now;
+
+    if (!is_double_click)
+      return;
+
     /* Check if it's a file (.txt) */
     int len = 0;
     while (st->selected[len])
@@ -1286,7 +1286,8 @@ static void fm_on_mouse(struct window *win, int x, int y, int buttons) {
       gui_open_notepad(full_path);
     } else if (str_ends_with_ci(st->selected, ".jpg") ||
                str_ends_with_ci(st->selected, ".jpeg") ||
-               str_ends_with_ci(st->selected, ".png")) {
+               str_ends_with_ci(st->selected, ".png") ||
+               str_ends_with_ci(st->selected, ".bmp")) {
       gui_open_image_viewer(full_path);
     } else if (str_ends_with_ci(st->selected, ".mp3")) {
       gui_play_mp3_file(full_path);
@@ -1423,7 +1424,12 @@ void gui_open_image_viewer(const char *path) {
   /* Decode new image into global state - detect format by magic bytes */
   int decode_ret = -1;
   /* PNG magic: 0x89 'P' 'N' 'G' */
-  if (size >= 4 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' &&
+  if (size >= 2 && data[0] == 'B' && data[1] == 'M') {
+    decode_ret = media_decode_bmp(data, size, &g_imgview.image);
+    if (decode_ret != 0) {
+      printk("Image Viewer: BMP decode failed\n");
+    }
+  } else if (size >= 4 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' &&
       data[3] == 'G') {
     decode_ret = media_decode_png(data, size, &g_imgview.image);
     if (decode_ret != 0) {

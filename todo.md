@@ -7,13 +7,13 @@ remove a known stub, or make the system easier to debug.
 ## P0 - Make The Desktop Reliable
 
 - [ ] Verify file manager double-click behavior in QEMU:
-  - [ ] one click selects files and folders;
+  - [x] one click selects files and folders;
   - [ ] double-click opens folders;
   - [ ] double-click opens `.txt` in Notepad;
   - [ ] double-click opens `.bmp`, `.png`, `.jpg`, `.jpeg` in Image Viewer.
 - [ ] Add visible error dialogs for unsupported file types instead of silent no-op.
 - [ ] Fix remaining input edge cases:
-  - [ ] keyboard input must not depend on mouse movement;
+  - [x] keyboard input must not depend on mouse movement;
   - [ ] PS/2 keyboard and mouse must work after window focus changes;
   - [ ] terminal, file manager, image viewer, DOOM, and Snake must not steal input from each other.
 - [ ] Add a small GUI debug overlay or serial log toggle for:
@@ -38,7 +38,7 @@ remove a known stub, or make the system easier to debug.
   - [ ] `dosfstools`;
   - [ ] clang/ld/lld or the selected toolchain.
 - [ ] Document known-good QEMU versions and flags.
-- [ ] Keep x86_64 as the default target until arm64 and x86 are genuinely maintained.
+- [x] Keep x86_64 as the default target until arm64 and x86 are genuinely maintained.
 
 ## P1 - File Manager
 

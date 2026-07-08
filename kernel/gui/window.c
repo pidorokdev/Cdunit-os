@@ -859,6 +859,15 @@ static int str_cmp(const char *s1, const char *s2) {
   return *(const unsigned char *)s1 - *(const unsigned char *)s2;
 }
 
+static int str_eq_len(const char *s, const char *name, int len) {
+  if (!s || !name || len < 0)
+    return 0;
+  int i = 0;
+  while (i < len && s[i] && s[i] == name[i])
+    i++;
+  return i == len && s[i] == '\0';
+}
+
 static char to_lower(char c) {
   if (c >= 'A' && c <= 'Z')
     return (char)(c + 32);
@@ -883,6 +892,21 @@ static int str_ends_with_ci(const char *name, const char *ext) {
   return 1;
 }
 
+static int str_ends_with_ci_len(const char *name, int nlen, const char *ext) {
+  if (!name || !ext || nlen < 0)
+    return 0;
+  int elen = 0;
+  while (ext[elen])
+    elen++;
+  if (elen == 0 || nlen < elen)
+    return 0;
+  for (int i = 0; i < elen; i++) {
+    if (to_lower(name[nlen - elen + i]) != to_lower(ext[i]))
+      return 0;
+  }
+  return 1;
+}
+
 static void draw_icon(int x, int y, int size, const unsigned char *icon,
                       uint32_t fg_color, uint32_t bg_color);
 
@@ -890,6 +914,7 @@ struct fm_state {
   char path[256];
   char selected[256];
   uint64_t last_click_ms;
+  int selected_clicks;
   int scroll_y;
 };
 
@@ -965,7 +990,7 @@ static int find_callback(void *ctx, const char *name, int len, loff_t off,
 
     /* HIT! */
     fc->clicked = 1;
-    fc->was_selected = (str_cmp(fc->st->selected, name) == 0);
+    fc->was_selected = str_eq_len(fc->st->selected, name, len);
 
     /* Handle selection */
     int i;
@@ -1040,17 +1065,17 @@ static int fm_render_callback(void *ctx, const char *name, int len,
         name[len - 2] == 'x' && name[len - 1] == 't') {
       bmp = icon_notepad;
       color = 0xFFFFFF;
-    } else if (str_ends_with_ci(name, ".jpg") ||
-               str_ends_with_ci(name, ".jpeg") ||
-               str_ends_with_ci(name, ".png") ||
-               str_ends_with_ci(name, ".bmp")) {
+    } else if (str_ends_with_ci_len(name, len, ".jpg") ||
+               str_ends_with_ci_len(name, len, ".jpeg") ||
+               str_ends_with_ci_len(name, len, ".png") ||
+               str_ends_with_ci_len(name, len, ".bmp")) {
       color = 0xF9E2AF;
-    } else if (str_ends_with_ci(name, ".mp3")) {
+    } else if (str_ends_with_ci_len(name, len, ".mp3")) {
       color = 0xA6E3A1;
-    } else if (str_ends_with_ci(name, ".py")) {
+    } else if (str_ends_with_ci_len(name, len, ".py")) {
       bmp = icon_python;
       color = 0xFFD43B; /* Python yellow */
-    } else if (str_ends_with_ci(name, ".nano")) {
+    } else if (str_ends_with_ci_len(name, len, ".nano")) {
       bmp = icon_nano;
       color = 0x22C55E; /* NanoLang green */
     }
@@ -1058,7 +1083,7 @@ static int fm_render_callback(void *ctx, const char *name, int len,
 
   /* Check if selected */
   int is_selected = 0;
-  if (c->state && str_cmp(c->state->selected, name) == 0) {
+  if (c->state && str_eq_len(c->state->selected, name, len)) {
     is_selected = 1;
   }
 
@@ -1252,13 +1277,22 @@ static void fm_on_mouse(struct window *win, int x, int y, int buttons) {
 
   if (fctx.clicked) {
     uint64_t now = arch_timer_get_ms();
+    if (fctx.was_selected) {
+      st->selected_clicks++;
+    } else {
+      st->selected_clicks = 1;
+    }
+
+    int in_double_click_window =
+        st->last_click_ms == 0 || now == 0 ||
+        (now >= st->last_click_ms && (now - st->last_click_ms) <= 600);
     int is_double_click =
-        fctx.was_selected && st->last_click_ms && now >= st->last_click_ms &&
-        (now - st->last_click_ms) <= 500;
+        fctx.was_selected && st->selected_clicks >= 2 && in_double_click_window;
     st->last_click_ms = now;
 
     if (!is_double_click)
       return;
+    st->selected_clicks = 0;
 
     /* Check if it's a file (.txt) */
     int len = 0;
@@ -4121,6 +4155,8 @@ struct window *gui_create_file_manager(int x, int y) {
       st->path[0] = '/';
       st->path[1] = '\0';
       st->selected[0] = '\0';
+      st->last_click_ms = 0;
+      st->selected_clicks = 0;
       st->scroll_y = 0;
       win->userdata = st;
       win->on_mouse = fm_on_mouse;
@@ -4158,6 +4194,8 @@ struct window *gui_create_file_manager_path(int x, int y, const char *path) {
         st->path[1] = '\0';
       }
       st->selected[0] = '\0';
+      st->last_click_ms = 0;
+      st->selected_clicks = 0;
       st->scroll_y = 0;
       win->userdata = st;
       win->on_mouse = fm_on_mouse;

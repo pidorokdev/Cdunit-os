@@ -7,3 +7,5 @@ image/
 *.bin
 *.log
 .DS_Store
+
+tmp/

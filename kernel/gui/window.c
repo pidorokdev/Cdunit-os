@@ -2659,20 +2659,6 @@ static void draw_rounded_rect(int x, int y, int w, int h, int r,
   }
 }
 
-/* Icon background colors for modern macOS Big Sur style */
-static const uint32_t icon_colors[] = {
-    0x1E1E1E, /* Terminal - dark gray/black */
-    0x3B82F6, /* Files - blue */
-    0xFF9500, /* Calculator - orange */
-    0xFFCC00, /* Notepad - yellow */
-    0x8E8E93, /* Settings - gray */
-    0x000000, /* Clock - black */
-    0xB91C1C, /* DOOM - dark red */
-    0x34D399, /* Snake - teal green */
-    0x3B82F6, /* Help - blue */
-    0x0EA5E9, /* Browser - sky blue */
-};
-
 /* Draw a filled circle */
 static void draw_filled_circle(int cx, int cy, int r, uint32_t color) {
   for (int y = -r; y <= r; y++) {
@@ -2919,42 +2905,13 @@ static void draw_dock(void) {
     int draw_x = cx - size / 2;
     int draw_y = cy - size / 2;
 
-    int icon_r = size / 5;
-    uint32_t bg_color = icon_colors[i];
-
-    /* Icon Background */
-    gui_draw_rect(draw_x + icon_r, draw_y, size - 2 * icon_r, size, bg_color);
-    gui_draw_rect(draw_x, draw_y + icon_r, size, size - 2 * icon_r, bg_color);
-    /* Corners */
-    for (int dy = -icon_r; dy <= icon_r; dy++) {
-      for (int dx = -icon_r; dx <= icon_r; dx++) {
-        if (dx * dx + dy * dy <= icon_r * icon_r) {
-          draw_pixel(draw_x + icon_r + dx, draw_y + icon_r + dy, bg_color);
-          draw_pixel(draw_x + size - icon_r - 1 + dx, draw_y + icon_r + dy,
-                     bg_color);
-          draw_pixel(draw_x + icon_r + dx, draw_y + size - icon_r - 1 + dy,
-                     bg_color);
-          draw_pixel(draw_x + size - icon_r - 1 + dx,
-                     draw_y + size - icon_r - 1 + dy, bg_color);
-        }
-      }
-    }
-
-    /* Top Highlight */
-    for (int x = draw_x + icon_r; x < draw_x + size - icon_r; x++) {
-      draw_pixel(x, draw_y + 2, bg_color + 0x202020);
-      draw_pixel(x, draw_y + 3, bg_color + 0x202020);
-    }
-
-    /* Bitmap Icon */
+    /* Full bitmap icon tile */
     if (i < 10) {
       const uint32_t *icon_data = dock_icons[i];
-      int bmp_size = size * 3 / 4;
-      int offset = (size - bmp_size) / 2;
-      for (int dy = 0; dy < bmp_size; dy++) {
-        for (int dx = 0; dx < bmp_size; dx++) {
-          int sx = dx * DOCK_ICON_BITMAP_SIZE / bmp_size;
-          int sy = dy * DOCK_ICON_BITMAP_SIZE / bmp_size;
+      for (int dy = 0; dy < size; dy++) {
+        for (int dx = 0; dx < size; dx++) {
+          int sx = dx * DOCK_ICON_BITMAP_SIZE / size;
+          int sy = dy * DOCK_ICON_BITMAP_SIZE / size;
           if (sx >= DOCK_ICON_BITMAP_SIZE)
             sx = DOCK_ICON_BITMAP_SIZE - 1;
           if (sy >= DOCK_ICON_BITMAP_SIZE)
@@ -2962,8 +2919,7 @@ static void draw_dock(void) {
 
           uint32_t px = icon_data[sy * DOCK_ICON_BITMAP_SIZE + sx];
           if ((px >> 24) > 128) {
-            draw_pixel(draw_x + offset + dx, draw_y + offset + dy,
-                       px & 0xFFFFFF);
+            draw_pixel(draw_x + dx, draw_y + dy, px & 0xFFFFFF);
           }
         }
       }

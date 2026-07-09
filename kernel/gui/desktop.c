@@ -6,6 +6,7 @@
  */
 
 #include "fs/vfs.h"
+#include "file_assoc.h"
 #include "mm/kmalloc.h"
 #include "printk.h"
 #include "types.h"
@@ -27,8 +28,6 @@ extern struct window *gui_create_file_manager_path(int x, int y,
                                                    const char *path);
 extern uint32_t gui_get_screen_width(void);
 extern uint32_t gui_get_screen_height(void);
-extern void gui_open_image_viewer(const char *path);
-extern void gui_open_notepad(const char *path);
 extern void gui_set_window_userdata(struct window *win, void *data);
 
 /* External terminal functions */
@@ -126,11 +125,7 @@ static desktop_icon_t desktop_icons[DESKTOP_MAX_ICONS];
 static int desktop_icon_count = 0;
 static int desktop_sort_mode = SORT_NAME;
 static int desktop_show_hidden = 0;
-static int desktop_stacks_enabled = 0;
 static int desktop_selected_count = 0;
-static int desktop_last_click_x = 0;
-static int desktop_last_click_y = 0;
-static uint64_t desktop_last_click_time = 0;
 
 /* Context menu */
 static context_menu_t ctx_menu = {0};
@@ -806,50 +801,7 @@ static void menu_action_open(void *ctx) {
   for (int i = 0; i < desktop_icon_count; i++) {
     if (desktop_icons[i].selected) {
       printk(KERN_INFO "DESKTOP: Opening %s\n", desktop_icons[i].path);
-
-      if (desktop_icons[i].type == ICON_TYPE_FOLDER) {
-        /* Open folder in file manager */
-        gui_create_file_manager_path(200, 100, desktop_icons[i].path);
-      } else if (desktop_icons[i].type == ICON_TYPE_IMAGE) {
-        gui_open_image_viewer(desktop_icons[i].path);
-      } else if (desktop_icons[i].type == ICON_TYPE_TEXT) {
-        gui_open_notepad(desktop_icons[i].path);
-      } else if (desktop_icons[i].type == ICON_TYPE_AUDIO) {
-        /* Play audio file */
-        printk(KERN_INFO "DESKTOP: Playing audio %s\n", desktop_icons[i].path);
-      } else if (desktop_icons[i].type == ICON_TYPE_PYTHON ||
-                 desktop_icons[i].type == ICON_TYPE_NANO) {
-        /* Python/NanoLang - open terminal and run */
-        static int py_spawn_x = 150;
-        static int py_spawn_y = 120;
-
-        struct window *win =
-            gui_create_window("Terminal", py_spawn_x, py_spawn_y, 500, 350);
-        if (win) {
-          int cx = py_spawn_x + 2;
-          int cy = py_spawn_y + 30;
-          struct terminal *term = term_create(cx, cy, 60, 18);
-          if (term) {
-            gui_set_window_userdata(win, term);
-            term_set_active(term);
-            term_set_content_pos(term, cx, cy);
-
-            char run_cmd[300] = "run ";
-            int j = 4;
-            for (int k = 0; desktop_icons[i].path[k] && j < 298; k++) {
-              run_cmd[j++] = desktop_icons[i].path[k];
-            }
-            run_cmd[j] = '\0';
-            term_execute_command(term, run_cmd);
-            term_puts(term, "\n\033[32mroot@dunit\033[0m:\033[34m~\033[0m# ");
-          }
-        }
-        py_spawn_x = (py_spawn_x + 40) % 300 + 100;
-        py_spawn_y = (py_spawn_y + 35) % 200 + 80;
-      } else {
-        /* Default: try to open as text */
-        gui_open_notepad(desktop_icons[i].path);
-      }
+      gui_open_path(desktop_icons[i].path);
     }
   }
 }

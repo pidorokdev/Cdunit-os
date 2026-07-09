@@ -5,6 +5,8 @@
  */
 
 #include "media/media.h"
+#include "file_assoc.h"
+#include "fs/vfs.h"
 #include "mm/kmalloc.h"
 #include "printk.h"
 #include "types.h"
@@ -27,6 +29,7 @@ extern struct window *gui_create_window(const char *title, int x, int y, int w,
 #define TERM_CHAR_W 8
 #define TERM_CHAR_H 16
 #define TERM_PADDING 4
+#define TERM_SCROLLBACK_LINES 256
 
 /* Terminal colors (VT100/ANSI) */
 static const uint32_t term_colors[16] = {
@@ -79,6 +82,9 @@ struct terminal {
 
   /* Scrollback */
   int scroll_offset;
+  char *scrollback;
+  int scrollback_count;
+  int scrollback_start;
 
   /* Associated window */
   struct window *window;
@@ -88,6 +94,8 @@ struct terminal {
   char input_buf[256];
   int input_len;
   int input_pos;
+  int input_origin_x;
+  int input_origin_y;
 
   /* Shell process */
   int shell_pid;
@@ -101,6 +109,7 @@ struct terminal {
 #define TERM_HISTORY_LEN 128
   char history[32][128];
   int history_count;
+  int history_index;
 };
 
 static struct terminal *active_terminal = NULL;
@@ -119,6 +128,25 @@ static void term_clear_line(struct terminal *term, int row) {
 }
 
 static void term_scroll_up(struct terminal *term) {
+  if (term->scrollback) {
+    int dst_line;
+    if (term->scrollback_count < TERM_SCROLLBACK_LINES) {
+      dst_line = (term->scrollback_start + term->scrollback_count) %
+                 TERM_SCROLLBACK_LINES;
+      term->scrollback_count++;
+    } else {
+      dst_line = term->scrollback_start;
+      term->scrollback_start =
+          (term->scrollback_start + 1) % TERM_SCROLLBACK_LINES;
+    }
+
+    for (int col = 0; col < term->cols; col++) {
+      char c = term->chars[col];
+      term->scrollback[dst_line * term->cols + col] =
+          (c >= 32 && c < 127) ? c : ' ';
+    }
+  }
+
   /* Move all lines up by one */
   for (int row = 0; row < term->rows - 1; row++) {
     for (int col = 0; col < term->cols; col++) {
@@ -259,6 +287,9 @@ static void term_process_escape(struct terminal *term) {
 /* ===================================================================== */
 
 void term_putc(struct terminal *term, char c) {
+  if (term->scroll_offset > 0)
+    term->scroll_offset = 0;
+
   if (term->in_escape) {
     term->escape_buf[term->escape_len++] = c;
 
@@ -337,13 +368,32 @@ void term_render(struct terminal *term) {
                 term->cols * TERM_CHAR_W + TERM_PADDING * 2,
                 term->rows * TERM_CHAR_H + TERM_PADDING * 2, term_colors[0]);
 
+  int total_lines = term->scrollback_count + term->rows;
+  int first_line = total_lines - term->rows - term->scroll_offset;
+  if (first_line < 0)
+    first_line = 0;
+
   /* Draw characters */
   for (int row = 0; row < term->rows; row++) {
     for (int col = 0; col < term->cols; col++) {
-      int idx = row * term->cols + col;
-      char c = term->chars[idx];
-      uint32_t fg = term_colors[term->fg_colors[idx] & 0xF];
-      uint32_t bg = term_colors[term->bg_colors[idx] & 0xF];
+      int src_line = first_line + row;
+      char c = ' ';
+      uint32_t fg = term_colors[7];
+      uint32_t bg = term_colors[0];
+
+      if (src_line < term->scrollback_count && term->scrollback) {
+        int hist_line =
+            (term->scrollback_start + src_line) % TERM_SCROLLBACK_LINES;
+        c = term->scrollback[hist_line * term->cols + col];
+      } else {
+        int live_row = src_line - term->scrollback_count;
+        if (live_row >= 0 && live_row < term->rows) {
+          int idx = live_row * term->cols + col;
+          c = term->chars[idx];
+          fg = term_colors[term->fg_colors[idx] & 0xF];
+          bg = term_colors[term->bg_colors[idx] & 0xF];
+        }
+      }
 
       int x = base_x + col * TERM_CHAR_W;
       int y = base_y + row * TERM_CHAR_H;
@@ -353,11 +403,22 @@ void term_render(struct terminal *term) {
   }
 
   /* Draw cursor */
-  if (term->cursor_visible) {
+  if (term->cursor_visible && term->scroll_offset == 0) {
     int x = base_x + term->cursor_x * TERM_CHAR_W;
     int y = base_y + term->cursor_y * TERM_CHAR_H;
     gui_draw_rect(x, y, TERM_CHAR_W, TERM_CHAR_H, term_colors[7]);
   }
+}
+
+void term_scroll_lines(struct terminal *term, int lines) {
+  if (!term || lines == 0)
+    return;
+
+  term->scroll_offset += lines;
+  if (term->scroll_offset < 0)
+    term->scroll_offset = 0;
+  if (term->scroll_offset > term->scrollback_count)
+    term->scroll_offset = term->scrollback_count;
 }
 
 /* ===================================================================== */
@@ -370,6 +431,27 @@ static int str_starts_with(const char *str, const char *prefix) {
       return 0;
   }
   return 1;
+}
+
+static int cmd_is(const char *cmd, const char *name) {
+  int i = 0;
+  while (name[i]) {
+    if (cmd[i] != name[i])
+      return 0;
+    i++;
+  }
+  return cmd[i] == '\0' || cmd[i] == ' ';
+}
+
+static const char *cmd_arg(const char *cmd, const char *name) {
+  int i = 0;
+  while (name[i] && cmd[i] == name[i])
+    i++;
+  if (name[i] || (cmd[i] != '\0' && cmd[i] != ' '))
+    return NULL;
+  while (cmd[i] == ' ')
+    i++;
+  return cmd + i;
 }
 
 static char to_lower(char c) {
@@ -439,12 +521,12 @@ static void build_path(struct terminal *term, const char *input, char *out,
   out[idx] = '\0';
 }
 
-#include "fs/vfs.h"
-
 /* Helper for ls command */
 static int ls_callback(void *ctx, const char *name, int len, loff_t offset,
                        ino_t ino, unsigned type) {
   struct terminal *term = (struct terminal *)ctx;
+  (void)offset;
+  (void)ino;
 
   char buf[256];
   int i;
@@ -465,6 +547,49 @@ static int ls_callback(void *ctx, const char *name, int len, loff_t offset,
   return 0;
 }
 
+static void term_print_prompt(struct terminal *term) {
+  term_puts(term, "\033[32mroot@dunit\033[0m:\033[34m");
+  if (term->cwd[0])
+    term_puts(term, term->cwd);
+  else
+    term_puts(term, "/");
+  term_puts(term, "\033[0m# ");
+  term->input_origin_x = term->cursor_x;
+  term->input_origin_y = term->cursor_y;
+}
+
+static void term_redraw_input(struct terminal *term) {
+  term->cursor_x = term->input_origin_x;
+  term->cursor_y = term->input_origin_y;
+
+  for (int col = term->input_origin_x; col < term->cols; col++) {
+    int idx = term->cursor_y * term->cols + col;
+    term->chars[idx] = ' ';
+    term->fg_colors[idx] = term->current_fg;
+    term->bg_colors[idx] = term->current_bg;
+  }
+
+  for (int i = 0; i < term->input_len; i++)
+    term_putc(term, term->input_buf[i]);
+
+  term->cursor_x = term->input_origin_x + term->input_pos;
+  term->cursor_y = term->input_origin_y;
+  if (term->cursor_x >= term->cols)
+    term->cursor_x = term->cols - 1;
+}
+
+static void term_set_input(struct terminal *term, const char *text) {
+  int i = 0;
+  while (text && text[i] && i < (int)sizeof(term->input_buf) - 1) {
+    term->input_buf[i] = text[i];
+    i++;
+  }
+  term->input_buf[i] = '\0';
+  term->input_len = i;
+  term->input_pos = i;
+  term_redraw_input(term);
+}
+
 void term_execute_command(struct terminal *term, const char *cmd) {
   /* Skip leading whitespace */
   while (*cmd == ' ')
@@ -474,29 +599,30 @@ void term_execute_command(struct terminal *term, const char *cmd) {
     return;
 
   /* Built-in commands */
-  if (str_starts_with(cmd, "clear")) {
+  if (cmd_is(cmd, "clear")) {
     for (int row = 0; row < term->rows; row++) {
       term_clear_line(term, row);
     }
     term->cursor_x = 0;
     term->cursor_y = 0;
-  } else if (str_starts_with(cmd, "help")) {
+  } else if (cmd_is(cmd, "help")) {
     term_puts(term, "\033[1;32mDunit OS Green Tea Terminal\033[0m\n");
     term_puts(term, "\033[33mFile Commands:\033[0m\n");
-    term_puts(term, "  ls        - List directory contents\n");
+    term_puts(term, "  ls [dir]  - List directory contents\n");
     term_puts(term, "  cd <dir>  - Change directory\n");
     term_puts(term, "  pwd       - Print working directory\n");
     term_puts(term, "  cat <f>   - Display file contents\n");
+    term_puts(term, "  open <p>  - Open file or directory in GUI\n");
     term_puts(term, "  touch <f> - Create empty file\n");
     term_puts(term, "  mkdir <d> - Create directory\n");
     term_puts(term, "  rmdir <d> - Remove empty directory\n");
     term_puts(term, "  rm <f>    - Remove file\n");
     term_puts(term, "\033[33mMedia Commands:\033[0m\n");
     term_puts(term, "  play <f>  - Play MP3 audio\n");
-    term_puts(term, "  view <f>  - View JPEG image\n");
+    term_puts(term, "  view <f>  - View image file\n");
     term_puts(term, "  sound     - Test audio output\n");
     term_puts(term, "\033[33mLanguages:\033[0m\n");
-    term_puts(term, "  run <f>   - Execute file (.py/.nano)\n");
+    term_puts(term, "  run <f>   - Demo-run .py/.nano source\n");
     term_puts(term, "  languages - List supported languages\n");
     term_puts(term, "  man <cmd> - Manual pages (nanoc,python,cpp)\n");
     term_puts(term, "\033[33mSystem:\033[0m\n");
@@ -506,74 +632,73 @@ void term_execute_command(struct terminal *term, const char *cmd) {
     term_puts(term, "  id        - Show user/group info\n");
     term_puts(term, "  hostname  - Show hostname\n");
     term_puts(term, "  history   - Show command history\n");
-    term_puts(term, "  free      - Memory usage\n");
-    term_puts(term, "  ps        - Process list\n");
     term_puts(term, "  clear     - Clear screen\n");
     term_puts(term, "  help      - This help message\n");
-    term_puts(term, "\033[33mNetwork:\033[0m\n");
-    term_puts(term, "  ping <h>  - Ping a host\n");
-    term_puts(term, "  ifconfig  - Show network interfaces\n");
-    term_puts(term, "  netstat   - Show connections\n");
-    term_puts(term, "  nslookup  - DNS lookup\n");
-    term_puts(term, "  curl/wget - HTTP request\n");
-  } else if (str_starts_with(cmd, "ls")) {
+    term_puts(term, "\033[33mExperimental:\033[0m\n");
+    term_puts(term, "  browser   - Open browser window shell\n");
+    term_puts(term, "  ping <ip> - Send one ICMP echo packet\n");
+  } else if (cmd_is(cmd, "ls")) {
+    const char *arg = cmd_arg(cmd, "ls");
+    char target[256];
     const char *path = term->cwd[0] ? term->cwd : "/";
+    if (arg && arg[0]) {
+      build_path(term, arg, target, sizeof(target));
+      path = target;
+    }
     struct file *dir = vfs_open(path, O_RDONLY, 0);
     if (dir) {
       vfs_readdir(dir, term, ls_callback);
       vfs_close(dir);
       term_puts(term, "\n");
     } else {
-      term_puts(term, "ls: Failed to open root directory\n");
+      term_puts(term, "ls: cannot open directory: ");
+      term_puts(term, path);
+      term_puts(term, "\n");
     }
-  } else if (str_starts_with(cmd, "pwd")) {
+  } else if (cmd_is(cmd, "pwd")) {
     if (term->cwd[0])
       term_puts(term, term->cwd);
     else
       term_puts(term, "/");
     term_puts(term, "\n");
-  } else if (str_starts_with(cmd, "cd ")) {
-    char *path = (char *)cmd + 3;
-    while (*path == ' ')
-      path++;
-
-    /* Remove newline if present */
-    int len = 0;
-    while (path[len] && path[len] != '\n')
-      len++;
-    path[len] = '\0';
-
-    if (len == 0)
-      return;
-
-    /* Handle relative paths manually for now or use vfs_lookup if absolute */
+  } else if (cmd_is(cmd, "cd")) {
+    const char *arg = cmd_arg(cmd, "cd");
     char target[256];
-    if (path[0] == '/') {
+    if (!arg || !arg[0]) {
+      target[0] = '/';
+      target[1] = '\0';
+    } else if (arg[0] == '.' && arg[1] == '\0') {
       int i = 0;
-      while (path[i] && i < 255) {
-        target[i] = path[i];
-        i++;
-      }
-      target[i] = '\0';
-    } else {
-      /* Append to CWD */
-      int i = 0;
-      while (term->cwd[i]) {
+      while (term->cwd[i] && i < (int)sizeof(target) - 1) {
         target[i] = term->cwd[i];
         i++;
       }
-      if (i > 0 && target[i - 1] != '/')
-        target[i++] = '/';
-      int j = 0;
-      while (path[j] && i < 255) {
-        target[i++] = path[j++];
+      target[i] = '\0';
+    } else if (arg[0] == '.' && arg[1] == '.' && arg[2] == '\0') {
+      int i = 0;
+      while (term->cwd[i] && i < (int)sizeof(target) - 1) {
+        target[i] = term->cwd[i];
+        i++;
       }
       target[i] = '\0';
+      while (i > 1 && target[i - 1] == '/')
+        target[--i] = '\0';
+      while (i > 1 && target[i - 1] != '/')
+        target[--i] = '\0';
+      if (i > 1 && target[i - 1] == '/')
+        target[i - 1] = '\0';
+      if (target[0] == '\0') {
+        target[0] = '/';
+        target[1] = '\0';
+      }
+    } else {
+      build_path(term, arg, target, sizeof(target));
     }
 
     /* Verify path exists and is dir */
     struct file *dir = vfs_open(target, O_RDONLY, 0);
-    if (dir) {
+    if (dir && dir->f_dentry && dir->f_dentry->d_inode &&
+        S_ISDIR(dir->f_dentry->d_inode->i_mode)) {
       /* Success */
       int i = 0;
       while (target[i]) {
@@ -583,34 +708,66 @@ void term_execute_command(struct terminal *term, const char *cmd) {
       term->cwd[i] = '\0';
       vfs_close(dir);
     } else {
+      if (dir)
+        vfs_close(dir);
       term_puts(term, "cd: No such directory: ");
+      term_puts(term, target);
+      term_puts(term, "\n");
+    }
+  } else if (cmd_is(cmd, "cat")) {
+    const char *arg = cmd_arg(cmd, "cat");
+    char path[256];
+    build_path(term, arg ? arg : "", path, sizeof(path));
+    if (!path[0]) {
+      term_puts(term, "cat: missing file\n");
+      return;
+    }
+    struct file *f = vfs_open(path, O_RDONLY, 0);
+    if (f) {
+      char buf[512];
+      int n;
+      while ((n = vfs_read(f, buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        term_puts(term, buf);
+      }
+      vfs_close(f);
+      term_puts(term, "\n");
+    } else {
+      term_puts(term, "cat: ");
+      term_puts(term, path);
+      term_puts(term, ": No such file\n");
+    }
+  } else if (cmd_is(cmd, "open")) {
+    char path[256];
+    const char *arg = cmd_arg(cmd, "open");
+    build_path(term, arg ? arg : "", path, sizeof(path));
+    if (!path[0]) {
+      term_puts(term, "open: missing path\n");
+      return;
+    }
+
+    if (gui_open_path(path) != 0) {
+      term_puts(term, "open: unsupported or missing path: ");
       term_puts(term, path);
       term_puts(term, "\n");
     }
-  } else if (str_starts_with(cmd, "cat")) {
-    term_puts(term, "cat: No such file or directory\n");
-  } else if (str_starts_with(cmd, "echo ")) {
-    term_puts(term, cmd + 5);
+  } else if (cmd_is(cmd, "echo")) {
+    const char *arg = cmd_arg(cmd, "echo");
+    term_puts(term, arg ? arg : "");
     term_puts(term, "\n");
-  } else if (str_starts_with(cmd, "uname")) {
+  } else if (cmd_is(cmd, "uname")) {
     term_puts(term, "Dunit OS 0.5.0 Green Tea x86_64\n");
-  } else if (str_starts_with(cmd, "date")) {
-    term_puts(term, "Thu Jan 16 21:35:00 EST 2026\n");
-  } else if (str_starts_with(cmd, "uptime")) {
-    term_puts(term, " 21:35:00 up 0 min,  1 user,  load: 0.00, 0.00, 0.00\n");
-  } else if (str_starts_with(cmd, "free")) {
-    term_puts(term, "              total        used        free\n");
-    term_puts(term, "Mem:         252 MB       12 MB      240 MB\n");
-    term_puts(term, "Swap:          0 MB        0 MB        0 MB\n");
-  } else if (str_starts_with(cmd, "ps")) {
-    term_puts(term, "  PID TTY          TIME CMD\n");
-    term_puts(term, "    1 ?        00:00:00 init\n");
-    term_puts(term, "    2 ?        00:00:00 kthread\n");
-    term_puts(term, "   10 tty1     00:00:00 shell\n");
-  } else if (str_starts_with(cmd, "whoami")) {
+  } else if (cmd_is(cmd, "date")) {
+    term_puts(term, "date: no realtime clock is wired yet\n");
+  } else if (cmd_is(cmd, "uptime")) {
+    term_puts(term, "uptime: runtime accounting is not wired yet\n");
+  } else if (cmd_is(cmd, "free")) {
+    term_puts(term, "free: memory accounting is not exposed yet\n");
+  } else if (cmd_is(cmd, "ps")) {
+    term_puts(term, "ps: process listing is not exposed yet\n");
+  } else if (cmd_is(cmd, "whoami")) {
     term_puts(term, "root\n");
-  } else if (str_starts_with(cmd, "dufetch") ||
-             str_starts_with(cmd, "neofetch")) {
+  } else if (cmd_is(cmd, "dufetch") || cmd_is(cmd, "neofetch")) {
     term_puts(term, "\033[32m");
     term_puts(term, "        .::::::::.       root@dunit\n");
     term_puts(term, "     .:::: dunit :::.    ------------\n");
@@ -622,11 +779,12 @@ void term_execute_command(struct terminal *term, const char *cmd) {
     term_puts(term, "\033[33mKernel:\033[0m  Dunit Kernel multiarch\n");
     term_puts(term, "\033[33mHost:\033[0m    QEMU desktop target\n");
     term_puts(term, "\033[33mPrompt:\033[0m  root@dunit:~#\n");
-  } else if (str_starts_with(cmd, "exit")) {
+  } else if (cmd_is(cmd, "exit")) {
     term_puts(term, "\033[33mGoodbye!\033[0m\n");
-  } else if (str_starts_with(cmd, "play ")) {
+  } else if (cmd_is(cmd, "play")) {
     char path[256];
-    build_path(term, cmd + 5, path, sizeof(path));
+    const char *arg = cmd_arg(cmd, "play");
+    build_path(term, arg ? arg : "", path, sizeof(path));
     if (!path[0]) {
       term_puts(term, "play: missing file\n");
       return;
@@ -657,22 +815,24 @@ void term_execute_command(struct terminal *term, const char *cmd) {
     intel_hda_play_pcm(audio.samples, audio.sample_count, audio.channels,
                        audio.sample_rate);
     media_free_audio(&audio);
-  } else if (str_starts_with(cmd, "view ")) {
+  } else if (cmd_is(cmd, "view")) {
     char path[256];
-    build_path(term, cmd + 5, path, sizeof(path));
+    const char *arg = cmd_arg(cmd, "view");
+    build_path(term, arg ? arg : "", path, sizeof(path));
     if (!path[0]) {
       term_puts(term, "view: missing file\n");
       return;
     }
 
-    if (!str_ends_with_ci(path, ".jpg") && !str_ends_with_ci(path, ".jpeg")) {
-      term_puts(term, "view: only .jpg/.jpeg supported\n");
+    if (!str_ends_with_ci(path, ".jpg") && !str_ends_with_ci(path, ".jpeg") &&
+        !str_ends_with_ci(path, ".png") && !str_ends_with_ci(path, ".bmp")) {
+      term_puts(term, "view: supported formats: .jpg, .jpeg, .png, .bmp\n");
       return;
     }
 
     extern void gui_open_image_viewer(const char *path);
     gui_open_image_viewer(path);
-  } else if (str_starts_with(cmd, "sound")) {
+  } else if (cmd_is(cmd, "sound")) {
     term_puts(term, "Playing test tone (440Hz Square Wave)...\n");
 
     extern int intel_hda_play_pcm(const void *data, uint32_t samples,
@@ -692,12 +852,17 @@ void term_execute_command(struct terminal *term, const char *cmd) {
     } else {
       term_puts(term, "Error: memory allocation failed\n");
     }
-  } else if (str_starts_with(cmd, "ping ")) {
+  } else if (cmd_is(cmd, "ping")) {
+    const char *arg = cmd_arg(cmd, "ping");
+    if (!arg || !arg[0]) {
+      term_puts(term, "ping: missing IPv4 address\n");
+      return;
+    }
     term_puts(term, "Pinging ");
-    term_puts(term, cmd + 5);
+    term_puts(term, arg);
     term_puts(term, "...\n");
 
-    char *ip_str = (char *)cmd + 5;
+    char *ip_str = (char *)arg;
     uint32_t ip = 0;
     int octet = 0;
     int shift = 24;
@@ -720,38 +885,13 @@ void term_execute_command(struct terminal *term, const char *cmd) {
     extern int icmp_send_echo(uint32_t dest_ip, uint16_t id, uint16_t seq);
     icmp_send_echo(ip, 1, 1);
     term_puts(term, "Packet sent.\n");
-  } else if (str_starts_with(cmd, "browser")) {
+  } else if (cmd_is(cmd, "browser")) {
     term_puts(term, "Starting Browser...\n");
     gui_create_window("Browser", 150, 100, 600, 450);
-  } else if (str_starts_with(cmd, "cat ")) {
-    char path[256];
-    build_path(term, cmd + 4, path, sizeof(path));
-    if (!path[0]) {
-      term_puts(term, "cat: missing file\n");
-      return;
-    }
-    struct file *f = vfs_open(path, O_RDONLY, 0);
-    if (f) {
-      char buf[512];
-      int n;
-      while ((n = vfs_read(f, buf, sizeof(buf) - 1)) > 0) {
-        buf[n] = '\0';
-        term_puts(term, buf);
-      }
-      vfs_close(f);
-      term_puts(term, "\n");
-    } else {
-      term_puts(term, "cat: ");
-      term_puts(term, path);
-      term_puts(term, ": No such file\n");
-    }
-    /* touch command handled later with better implementation */
-  } else if (str_starts_with(cmd, "mkdir_placeholder")) {
-    /* placeholder removed - mkdir implemented below */
-  } else if (str_starts_with(cmd, "rm_placeholder")) {
-    /* placeholder removed - rm implemented below */
-  } else if (str_starts_with(cmd, "man ")) {
-    const char *topic = cmd + 4;
+  } else if (cmd_is(cmd, "man")) {
+    const char *topic = cmd_arg(cmd, "man");
+    if (!topic)
+      topic = "";
     while (*topic == ' ')
       topic++;
     if (str_starts_with(topic, "nanoc") || str_starts_with(topic, "nano")) {
@@ -778,29 +918,28 @@ void term_execute_command(struct terminal *term, const char *cmd) {
       term_puts(term, topic);
       term_puts(term, "\n");
     }
-  } else if (str_starts_with(cmd, "nanoc ")) {
+  } else if (cmd_is(cmd, "nanoc")) {
     term_puts(term, "\033[33mNanoLang Compiler\033[0m\n");
     term_puts(term, "To compile NanoLang programs, run from host:\n");
     term_puts(term, "  cd vendor/nanolang\n");
     term_puts(term, "  ./bin/nanoc ../../examples/hello.nano -o hello\n");
     term_puts(term, "  ./hello\n");
-  } else if (str_starts_with(cmd, "python ")) {
+  } else if (cmd_is(cmd, "python")) {
     term_puts(term, "\033[33mMicroPython\033[0m\n");
     term_puts(term, "MicroPython available at vendor/micropython/\n");
     term_puts(term, "Build with: make -C ports/unix\n");
-  } else if (str_starts_with(cmd, "cpp ") || str_starts_with(cmd, "g++ ")) {
+  } else if (cmd_is(cmd, "cpp") || cmd_is(cmd, "g++")) {
     term_puts(term, "\033[33mC++ Cross-Compiler\033[0m\n");
     term_puts(term, "Cross-compile with:\n");
     term_puts(term,
               "  aarch64-none-elf-g++ -nostdlib -ffreestanding <file.cpp>\n");
-  } else if (str_starts_with(cmd, "languages") ||
-             str_starts_with(cmd, "lang")) {
+  } else if (cmd_is(cmd, "languages") || cmd_is(cmd, "lang")) {
     term_puts(term, "\033[1;36mSupported Languages:\033[0m\n");
     term_puts(term, "  \033[32mNanoLang\033[0m - vendor/nanolang/bin/nanoc\n");
     term_puts(term, "  \033[32mMicroPython\033[0m - vendor/micropython/\n");
     term_puts(term, "  \033[32mC++\033[0m - aarch64-none-elf-g++\n");
     term_puts(term, "\nUse 'man <lang>' for details.\n");
-  } else if (str_starts_with(cmd, "history")) {
+  } else if (cmd_is(cmd, "history")) {
     term_puts(term, "\033[1;36mCommand History:\033[0m\n");
     for (int i = 0; i < term->history_count; i++) {
       char num[8];
@@ -818,8 +957,10 @@ void term_execute_command(struct terminal *term, const char *cmd) {
       term_puts(term, term->history[i]);
       term_puts(term, "\n");
     }
-  } else if (str_starts_with(cmd, "mkdir ")) {
-    char *path = (char *)cmd + 6;
+  } else if (cmd_is(cmd, "mkdir")) {
+    char *path = (char *)(cmd_arg(cmd, "mkdir"));
+    if (!path)
+      path = "";
     while (*path == ' ')
       path++;
     if (*path == '\0') {
@@ -835,8 +976,10 @@ void term_execute_command(struct terminal *term, const char *cmd) {
         term_puts(term, "\033[31mmkdir:\033[0m Cannot create directory\n");
       }
     }
-  } else if (str_starts_with(cmd, "rmdir ")) {
-    char *path = (char *)cmd + 6;
+  } else if (cmd_is(cmd, "rmdir")) {
+    char *path = (char *)(cmd_arg(cmd, "rmdir"));
+    if (!path)
+      path = "";
     while (*path == ' ')
       path++;
     if (*path == '\0') {
@@ -852,8 +995,10 @@ void term_execute_command(struct terminal *term, const char *cmd) {
         term_puts(term, "\033[31mrmdir:\033[0m Failed to remove directory\n");
       }
     }
-  } else if (str_starts_with(cmd, "rm ")) {
-    char *path = (char *)cmd + 3;
+  } else if (cmd_is(cmd, "rm")) {
+    char *path = (char *)(cmd_arg(cmd, "rm"));
+    if (!path)
+      path = "";
     while (*path == ' ')
       path++;
     if (*path == '\0') {
@@ -869,8 +1014,10 @@ void term_execute_command(struct terminal *term, const char *cmd) {
         term_puts(term, "\033[31mrm:\033[0m Cannot remove file\n");
       }
     }
-  } else if (str_starts_with(cmd, "touch ")) {
-    char *path = (char *)cmd + 6;
+  } else if (cmd_is(cmd, "touch")) {
+    char *path = (char *)(cmd_arg(cmd, "touch"));
+    if (!path)
+      path = "";
     while (*path == ' ')
       path++;
     if (*path == '\0') {
@@ -888,17 +1035,19 @@ void term_execute_command(struct terminal *term, const char *cmd) {
         term_puts(term, "\033[31mtouch:\033[0m Cannot create file\n");
       }
     }
-  } else if (str_starts_with(cmd, "id")) {
+  } else if (cmd_is(cmd, "id")) {
     term_puts(term, "uid=0(root) gid=0(root) groups=0(root)\n");
-  } else if (str_starts_with(cmd, "hostname")) {
+  } else if (cmd_is(cmd, "hostname")) {
     term_puts(term, "dunit\n");
-  } else if (str_starts_with(cmd, "head ") || str_starts_with(cmd, "tail ")) {
+  } else if (cmd_is(cmd, "head") || cmd_is(cmd, "tail")) {
     term_puts(term, "(file viewing commands coming soon)\n");
-  } else if (str_starts_with(cmd, "wc ")) {
+  } else if (cmd_is(cmd, "wc")) {
     term_puts(term, "(word count command coming soon)\n");
-  } else if (str_starts_with(cmd, "run ")) {
+  } else if (cmd_is(cmd, "run")) {
     /* Auto-detect and execute based on extension */
-    char *path = (char *)cmd + 4;
+    char *path = (char *)(cmd_arg(cmd, "run"));
+    if (!path)
+      path = "";
     while (*path == ' ')
       path++;
     if (*path == '\0') {
@@ -1024,114 +1173,10 @@ void term_execute_command(struct terminal *term, const char *cmd) {
   /* ===============================  */
   /* Network Commands                  */
   /* ===============================  */
-  else if (str_starts_with(cmd, "ping ")) {
-    const char *host = cmd + 5;
-    while (*host == ' ')
-      host++;
-
-    term_puts(term, "PING ");
-    term_puts(term, host);
-    term_puts(term, " (10.0.2.15): 56 data bytes\n");
-
-    /* Simulate 4 ping responses */
-    for (int i = 0; i < 4; i++) {
-      term_puts(term, "64 bytes from ");
-      term_puts(term, host);
-      char seq[32];
-      int s = 0;
-      seq[s++] = ':';
-      seq[s++] = ' ';
-      seq[s++] = 'i';
-      seq[s++] = 'c';
-      seq[s++] = 'm';
-      seq[s++] = 'p';
-      seq[s++] = '_';
-      seq[s++] = 's';
-      seq[s++] = 'e';
-      seq[s++] = 'q';
-      seq[s++] = '=';
-      seq[s++] = '0' + i;
-      seq[s++] = ' ';
-      seq[s++] = 't';
-      seq[s++] = 't';
-      seq[s++] = 'l';
-      seq[s++] = '=';
-      seq[s++] = '6';
-      seq[s++] = '4';
-      seq[s++] = ' ';
-      seq[s++] = 't';
-      seq[s++] = 'i';
-      seq[s++] = 'm';
-      seq[s++] = 'e';
-      seq[s++] = '=';
-      /* Random-ish time 10-50ms */
-      int time_ms = 15 + (i * 7) % 30;
-      seq[s++] = '0' + (time_ms / 10);
-      seq[s++] = '0' + (time_ms % 10);
-      seq[s++] = ' ';
-      seq[s++] = 'm';
-      seq[s++] = 's';
-      seq[s++] = '\n';
-      seq[s] = '\0';
-      term_puts(term, seq);
-    }
-    term_puts(term, "\n--- ping statistics ---\n");
-    term_puts(term, "4 packets transmitted, 4 received, 0% packet loss\n");
-    term_puts(term, "rtt min/avg/max = 15/28/42 ms\n");
-  } else if (str_starts_with(cmd, "ifconfig") ||
-             str_starts_with(cmd, "ip addr")) {
-    term_puts(term, "\033[1;32meth0:\033[0m "
-                    "flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\n");
-    term_puts(term, "        inet \033[33m10.0.2.15\033[0m  netmask "
-                    "255.255.255.0  broadcast 10.0.2.255\n");
-    term_puts(term, "        inet6 fe80::5054:ff:fe12:3456  prefixlen 64  "
-                    "scopeid 0x20<link>\n");
-    term_puts(term,
-              "        ether 52:54:00:12:34:56  txqueuelen 1000  (Ethernet)\n");
-    term_puts(term, "        RX packets 1542  bytes 163840 (160.0 KiB)\n");
-    term_puts(term, "        TX packets 892   bytes 94208 (92.0 KiB)\n");
-    term_puts(
-        term,
-        "\n\033[1;32mlo:\033[0m flags=73<UP,LOOPBACK,RUNNING>  mtu 65536\n");
-    term_puts(term, "        inet 127.0.0.1  netmask 255.0.0.0\n");
-    term_puts(term, "        inet6 ::1  prefixlen 128  scopeid 0x10<host>\n");
-    term_puts(term, "        loop  txqueuelen 1000  (Local Loopback)\n");
-  } else if (str_starts_with(cmd, "netstat")) {
-    term_puts(term, "Active Internet connections (servers and established)\n");
-    term_puts(term, "\033[1mProto  Local Address          Foreign Address      "
-                    "  State\033[0m\n");
-    term_puts(term,
-              "tcp    0.0.0.0:22             0.0.0.0:*              LISTEN\n");
-    term_puts(term,
-              "tcp    0.0.0.0:80             0.0.0.0:*              LISTEN\n");
-    term_puts(
-        term,
-        "tcp    10.0.2.15:22           10.0.2.2:54321         ESTABLISHED\n");
-    term_puts(term, "udp    0.0.0.0:68             0.0.0.0:*              \n");
-  } else if (str_starts_with(cmd, "nslookup ")) {
-    const char *domain = cmd + 9;
-    while (*domain == ' ')
-      domain++;
-    term_puts(term, "Server:         10.0.2.3\n");
-    term_puts(term, "Address:        10.0.2.3#53\n\n");
-    term_puts(term, "Non-authoritative answer:\n");
-    term_puts(term, "Name:   ");
-    term_puts(term, domain);
-    term_puts(term, "\nAddress: 93.184.216.34\n");
-  } else if (str_starts_with(cmd, "curl ") || str_starts_with(cmd, "wget ")) {
-    const char *url = cmd + 5;
-    while (*url == ' ')
-      url++;
-    term_puts(term, "Connecting to ");
-    term_puts(term, url);
-    term_puts(term, "...\n");
-    term_puts(term, "HTTP/1.1 200 OK\n");
-    term_puts(term, "Content-Type: text/html\n");
-    term_puts(term, "Content-Length: 1256\n\n");
-    term_puts(term,
-              "<!DOCTYPE html>\n<html><head><title>Example</title></head>\n");
-    term_puts(term,
-              "<body><h1>Hello from Dunit OS Network!</h1></body></html>\n");
+  else if (cmd_is(cmd, "ifconfig") || cmd_is(cmd, "ip") ||
+           cmd_is(cmd, "netstat") || cmd_is(cmd, "nslookup") ||
+           cmd_is(cmd, "curl") || cmd_is(cmd, "wget")) {
+    term_puts(term, "network: command not wired to the real stack yet\n");
   } else {
     term_puts(term, "\033[31mCommand not found:\033[0m ");
     term_puts(term, cmd);
@@ -1163,26 +1208,90 @@ void term_handle_key(struct terminal *term, int key) {
         }
         term->history[term->history_count][i] = '\0';
         term->history_count++;
+      } else {
+        for (int h = 1; h < 32; h++) {
+          int i = 0;
+          while (term->history[h][i] && i < 127) {
+            term->history[h - 1][i] = term->history[h][i];
+            i++;
+          }
+          term->history[h - 1][i] = '\0';
+        }
+        int i = 0;
+        while (i < term->input_len && i < 127) {
+          term->history[31][i] = term->input_buf[i];
+          i++;
+        }
+        term->history[31][i] = '\0';
       }
       term_execute_command(term, term->input_buf);
     }
 
     /* Show new prompt */
-    term_puts(term, "\033[32mroot@dunit\033[0m:\033[34m~\033[0m# ");
+    term_print_prompt(term);
 
     term->input_len = 0;
     term->input_pos = 0;
+    term->history_index = -1;
   } else if (key == '\b' || key == 127) {
-    if (term->input_len > 0) {
+    if (term->input_pos > 0 && term->input_len > 0) {
+      for (int i = term->input_pos - 1; i < term->input_len - 1; i++)
+        term->input_buf[i] = term->input_buf[i + 1];
       term->input_len--;
-      term->cursor_x--;
-      int idx = term->cursor_y * term->cols + term->cursor_x;
-      term->chars[idx] = ' ';
+      term->input_pos--;
+      term->input_buf[term->input_len] = '\0';
+      term_redraw_input(term);
     }
+  } else if (key == 0x100) { /* Up */
+    if (term->history_count > 0) {
+      if (term->history_index < 0)
+        term->history_index = term->history_count - 1;
+      else if (term->history_index > 0)
+        term->history_index--;
+      term_set_input(term, term->history[term->history_index]);
+    }
+  } else if (key == 0x101) { /* Down */
+    if (term->history_index >= 0) {
+      term->history_index++;
+      if (term->history_index >= term->history_count) {
+        term->history_index = -1;
+        term_set_input(term, "");
+      } else {
+        term_set_input(term, term->history[term->history_index]);
+      }
+    }
+  } else if (key == 0x102) { /* Left */
+    if (term->input_pos > 0) {
+      term->input_pos--;
+      term_redraw_input(term);
+    }
+  } else if (key == 0x103) { /* Right */
+    if (term->input_pos < term->input_len) {
+      term->input_pos++;
+      term_redraw_input(term);
+    }
+  } else if (key == 1) { /* Ctrl+A */
+    term->input_pos = 0;
+    term_redraw_input(term);
+  } else if (key == 5) { /* Ctrl+E */
+    term->input_pos = term->input_len;
+    term_redraw_input(term);
+  } else if (key == 3) { /* Ctrl+C */
+    term_puts(term, "^C\n");
+    term->input_len = 0;
+    term->input_pos = 0;
+    term->input_buf[0] = '\0';
+    term->history_index = -1;
+    term_print_prompt(term);
   } else if (key >= 32 && key < 127) {
     if (term->input_len < 255) {
-      term->input_buf[term->input_len++] = key;
-      term_putc(term, key);
+      for (int i = term->input_len; i > term->input_pos; i--)
+        term->input_buf[i] = term->input_buf[i - 1];
+      term->input_buf[term->input_pos] = (char)key;
+      term->input_len++;
+      term->input_pos++;
+      term->input_buf[term->input_len] = '\0';
+      term_redraw_input(term);
     }
   }
 }
@@ -1203,14 +1312,18 @@ struct terminal *term_create(int x, int y, int cols, int rows) {
   term->chars = kmalloc(buf_size);
   term->fg_colors = kmalloc(buf_size);
   term->bg_colors = kmalloc(buf_size);
+  term->scrollback = kmalloc(buf_size * TERM_SCROLLBACK_LINES);
 
-  if (!term->chars || !term->fg_colors || !term->bg_colors) {
+  if (!term->chars || !term->fg_colors || !term->bg_colors ||
+      !term->scrollback) {
     if (term->chars)
       kfree(term->chars);
     if (term->fg_colors)
       kfree(term->fg_colors);
     if (term->bg_colors)
       kfree(term->bg_colors);
+    if (term->scrollback)
+      kfree(term->scrollback);
     kfree(term);
     return NULL;
   }
@@ -1223,8 +1336,15 @@ struct terminal *term_create(int x, int y, int cols, int rows) {
   term->current_bg = 0;
   term->in_escape = false;
   term->escape_len = 0;
+  term->scroll_offset = 0;
+  term->scrollback_count = 0;
+  term->scrollback_start = 0;
   term->input_len = 0;
   term->input_pos = 0;
+  term->input_origin_x = 0;
+  term->input_origin_y = 0;
+  term->history_count = 0;
+  term->history_index = -1;
   term->content_x = x;
   term->content_y = y;
 
@@ -1241,7 +1361,7 @@ struct terminal *term_create(int x, int y, int cols, int rows) {
   term_puts(term, "\033[1;32mDunit OS 0.5.0 (Green Tea) tty1\033[0m\n");
   term_puts(term, "Type '\033[33mhelp\033[0m' for commands, "
                   "'\033[33mdufetch\033[0m' for system info.\n\n");
-  term_puts(term, "\033[32mroot@dunit\033[0m:\033[34m~\033[0m# ");
+  term_print_prompt(term);
 
   printk(KERN_INFO "TERM: Created terminal %dx%d\n", cols, rows);
 
@@ -1258,6 +1378,8 @@ void term_destroy(struct terminal *term) {
     kfree(term->fg_colors);
   if (term->bg_colors)
     kfree(term->bg_colors);
+  if (term->scrollback)
+    kfree(term->scrollback);
   kfree(term);
 }
 

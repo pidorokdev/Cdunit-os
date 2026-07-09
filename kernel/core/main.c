@@ -368,9 +368,6 @@ static void init_subsystems(void *dtb) {
  * start_init_process - Start the first userspace process (PID 1)
  */
 
-/* Global terminal pointer for keyboard callback */
-static void *g_active_terminal = 0;
-
 /* Keyboard callback wrapper */
 /* Keyboard callback wrapper */
 static void keyboard_handler(int key) {
@@ -412,7 +409,6 @@ static void start_init_process(void) {
   int last_mx = 0, last_my = 0;
   int last_buttons = 0;
   int needs_redraw = 1; /* Initial draw */
-  int cursor_only = 0;  /* Only cursor needs updating */
 
   /* Timer for periodic auto-refresh (33ms = 30 FPS for responsive UI) */
   uint64_t last_refresh = arch_timer_get_ms();
@@ -445,14 +441,21 @@ static void start_init_process(void) {
     /* Get mouse state (updated by input_poll) */
     extern void mouse_get_position(int *x, int *y);
     extern int mouse_get_buttons(void);
+    extern int mouse_get_scroll_delta(void);
     extern void gui_handle_mouse_event(int x, int y, int buttons);
 
     int mx, my;
     mouse_get_position(&mx, &my);
     int mbuttons = mouse_get_buttons();
+    int scroll = mouse_get_scroll_delta();
+    if (scroll > 0)
+      mbuttons |= 0x10; /* Wheel up */
+    else if (scroll < 0)
+      mbuttons |= 0x20; /* Wheel down */
 
     /* Check if mouse changed */
-    if (mx != last_mx || my != last_my || mbuttons != last_buttons) {
+    if (mx != last_mx || my != last_my || mbuttons != last_buttons ||
+        scroll != 0) {
       /* Always call mouse event handler for hover support */
       gui_handle_mouse_event(mx, my, mbuttons);
 
@@ -461,7 +464,7 @@ static void start_init_process(void) {
 
       last_mx = mx;
       last_my = my;
-      last_buttons = mbuttons;
+      last_buttons = mbuttons & ~0x30;
     }
 
     /* Periodic refresh for animations (5 FPS) */
@@ -475,7 +478,6 @@ static void start_init_process(void) {
     if (needs_redraw) {
       gui_compose(); /* Cursor is drawn inside compose, before blit */
       needs_redraw = 0;
-      cursor_only = 0;
     }
 
     frame++;

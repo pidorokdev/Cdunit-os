@@ -63,6 +63,9 @@
 #define ABS_X 0x00
 #define ABS_Y 0x01
 
+/* Relative axis codes */
+#define REL_WHEEL 0x08
+
 /* Button codes */
 #define BTN_LEFT 0x110
 #define BTN_RIGHT 0x111
@@ -129,6 +132,7 @@ static virtio_input_event_t event_bufs[QUEUE_SIZE] __attribute__((aligned(16)));
 static int mouse_x = 16384; /* Raw 0-32767 */
 static int mouse_y = 16384;
 static uint8_t mouse_buttons = 0;
+static int mouse_scroll_delta = 0;
 
 /* Keyboard state */
 static volatile uint32_t *kbd_base = 0;
@@ -163,7 +167,9 @@ static int ps2_extended = 0;
 static int ps2_mouse_x = SCREEN_WIDTH / 2;
 static int ps2_mouse_y = SCREEN_HEIGHT / 2;
 static int ps2_mouse_buttons = 0;
-static uint8_t ps2_mouse_packet[3];
+static int ps2_mouse_scroll_delta = 0;
+static int ps2_mouse_has_wheel = 0;
+static uint8_t ps2_mouse_packet[4];
 static int ps2_mouse_packet_pos = 0;
 
 static const char ps2_scancode_ascii[128] = {
@@ -231,6 +237,16 @@ static void ps2_write_mouse(uint8_t data) {
     (void)inb(PS2_DATA);
 }
 
+static int ps2_mouse_get_id(void) {
+  ps2_write_cmd(0xD4);
+  ps2_write_data(0xF2);
+  if (ps2_wait_output_full() == 0)
+    (void)inb(PS2_DATA); /* ACK */
+  if (ps2_wait_output_full() == 0)
+    return inb(PS2_DATA);
+  return -1;
+}
+
 static void ps2_send_key(int key) {
   if (key_callback)
     key_callback(key);
@@ -282,7 +298,8 @@ static void ps2_handle_mouse(uint8_t data) {
     return;
 
   ps2_mouse_packet[ps2_mouse_packet_pos++] = data;
-  if (ps2_mouse_packet_pos < 3)
+  int packet_size = ps2_mouse_has_wheel ? 4 : 3;
+  if (ps2_mouse_packet_pos < packet_size)
     return;
 
   ps2_mouse_packet_pos = 0;
@@ -303,6 +320,13 @@ static void ps2_handle_mouse(uint8_t data) {
     ps2_mouse_y = SCREEN_HEIGHT - 1;
 
   ps2_mouse_buttons = ps2_mouse_packet[0] & 0x07;
+
+  if (ps2_mouse_has_wheel) {
+    int wheel = ps2_mouse_packet[3] & 0x0F;
+    if (wheel & 0x08)
+      wheel |= ~0x0F;
+    ps2_mouse_scroll_delta -= wheel;
+  }
 }
 
 static void ps2_poll(void) {
@@ -340,6 +364,18 @@ static void ps2_init(void) {
   ps2_write_data(config);
 
   ps2_write_mouse(0xF6); /* Defaults */
+  ps2_write_mouse(0xF3); /* IntelliMouse wheel probe: sample rate 200 */
+  ps2_write_mouse(200);
+  ps2_write_mouse(0xF3); /* sample rate 100 */
+  ps2_write_mouse(100);
+  ps2_write_mouse(0xF3); /* sample rate 80 */
+  ps2_write_mouse(80);
+
+  int mouse_id = ps2_mouse_get_id();
+  ps2_mouse_has_wheel = (mouse_id == 3 || mouse_id == 4);
+  printk(KERN_INFO "PS2: Mouse ID %d%s\n", mouse_id,
+         ps2_mouse_has_wheel ? " (wheel)" : "");
+
   ps2_write_mouse(0xF4); /* Enable streaming */
 
   ps2_enabled = 1;
@@ -513,6 +549,9 @@ void mouse_poll(void) {
       } else if (ev->code == ABS_Y) {
         mouse_y = ev->value;
       }
+    } else if (ev->type == EV_REL) {
+      if (ev->code == REL_WHEEL)
+        mouse_scroll_delta += (int32_t)ev->value;
     } else if (ev->type == EV_KEY) {
       int pressed = (ev->value != 0);
       if (ev->code == BTN_LEFT) {
@@ -576,6 +615,23 @@ int mouse_get_buttons(void) {
 
   mouse_poll();
   return mouse_buttons;
+}
+
+int mouse_get_scroll_delta(void) {
+  int delta;
+#if defined(ARCH_X86_64) || defined(ARCH_X86)
+  ps2_poll();
+  if (ps2_enabled && !mouse_base) {
+    delta = ps2_mouse_scroll_delta;
+    ps2_mouse_scroll_delta = 0;
+    return delta;
+  }
+#endif
+
+  mouse_poll();
+  delta = mouse_scroll_delta;
+  mouse_scroll_delta = 0;
+  return delta;
 }
 
 /* ===================================================================== */

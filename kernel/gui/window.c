@@ -7,6 +7,7 @@
 #include "../core/process.h" /* For Doom launch */
 #include "desktop.h"         /* Desktop manager */
 #include "dock_icons.h"      /* Dock icons (PNG-based) */
+#include "file_assoc.h"      /* Shared file opening rules */
 #include "fs/vfs.h"          /* VFS headers */
 #include "icons.h"           /* Icon bitmaps */
 #include "media/media.h"
@@ -28,6 +29,7 @@ extern void term_handle_key(struct terminal *term, int key);
 extern int term_get_input_len(struct terminal *t);
 extern char term_get_input_char(struct terminal *t, int idx);
 extern void term_render(struct terminal *term);
+extern void term_scroll_lines(struct terminal *term, int lines);
 extern void term_set_content_pos(struct terminal *t, int x, int y);
 
 /* ===================================================================== */
@@ -251,6 +253,7 @@ static void calc_button_click(char key) {
 static char notepad_text[NOTEPAD_MAX_TEXT];
 static char notepad_filepath[256]; /* Track open file */
 static int notepad_cursor = 0;
+static int notepad_scroll_line = 0;
 
 /* Rename State */
 static char rename_text[256];
@@ -269,7 +272,6 @@ static char term_input[TERM_INPUT_MAX];
 static int term_input_len = 0;
 static char term_history[TERM_HISTORY_LINES][80];
 static int term_history_count = 0;
-static int term_scroll = 0;
 
 /* Snake game state */
 #define SNAKE_MAX_LEN 100
@@ -424,6 +426,20 @@ static void notepad_key(int key) {
     return;
   }
 
+  /* Ctrl+X - Cut all text to clipboard */
+  if (key == 24) { /* ASCII 24 = Ctrl+X */
+    clipboard_len = 0;
+    for (int i = 0; i < notepad_cursor && i < CLIPBOARD_MAX - 1; i++) {
+      clipboard_buffer[i] = notepad_text[i];
+      clipboard_len++;
+    }
+    clipboard_buffer[clipboard_len] = '\0';
+    notepad_text[0] = '\0';
+    notepad_cursor = 0;
+    notepad_scroll_line = 0;
+    return;
+  }
+
   /* Ctrl+V - Paste from clipboard */
   if (key == 22) { /* ASCII 22 = Ctrl+V */
     for (int i = 0; i < clipboard_len && notepad_cursor < NOTEPAD_MAX_TEXT - 1;
@@ -459,6 +475,109 @@ static void notepad_key(int key) {
     if (notepad_cursor < NOTEPAD_MAX_TEXT - 1) {
       notepad_text[notepad_cursor++] = '\n';
       notepad_text[notepad_cursor] = '\0';
+    }
+  }
+}
+
+static void notepad_copy_all(void) {
+  clipboard_len = 0;
+  for (int i = 0; i < notepad_cursor && i < CLIPBOARD_MAX - 1; i++) {
+    clipboard_buffer[i] = notepad_text[i];
+    clipboard_len++;
+  }
+  clipboard_buffer[clipboard_len] = '\0';
+}
+
+static void notepad_cut_all(void) {
+  notepad_copy_all();
+  notepad_text[0] = '\0';
+  notepad_cursor = 0;
+  notepad_scroll_line = 0;
+}
+
+static void notepad_paste(void) {
+  for (int i = 0; i < clipboard_len && notepad_cursor < NOTEPAD_MAX_TEXT - 1;
+       i++) {
+    notepad_text[notepad_cursor++] = clipboard_buffer[i];
+  }
+  notepad_text[notepad_cursor] = '\0';
+}
+
+static void notepad_new_file(void) {
+  notepad_text[0] = '\0';
+  notepad_cursor = 0;
+  notepad_scroll_line = 0;
+  notepad_filepath[0] = '\0';
+}
+
+static int notepad_save_file(void) {
+  if (!notepad_filepath[0]) {
+    const char *default_path = "/Desktop/untitled.txt";
+    int i = 0;
+    while (default_path[i] && i < 255) {
+      notepad_filepath[i] = default_path[i];
+      i++;
+    }
+    notepad_filepath[i] = '\0';
+  }
+
+  int len = 0;
+  while (notepad_text[len] && len < NOTEPAD_MAX_TEXT)
+    len++;
+
+  /* RamFS write does not truncate shorter overwrites, so recreate the file. */
+  vfs_unlink(notepad_filepath);
+  struct file *f = vfs_open(notepad_filepath, O_CREAT | O_WRONLY, 0644);
+  if (!f)
+    return -1;
+
+  ssize_t written = vfs_write(f, notepad_text, len);
+  vfs_close(f);
+  printk("Notepad: Saved %d bytes to %s\n", len, notepad_filepath);
+  return written == len ? 0 : -1;
+}
+
+static void notepad_load_file(const char *path) {
+  notepad_text[0] = '\0';
+  notepad_cursor = 0;
+  notepad_scroll_line = 0;
+
+  int i = 0;
+  while (path && path[i] && i < 255) {
+    notepad_filepath[i] = path[i];
+    i++;
+  }
+  notepad_filepath[i] = '\0';
+
+  struct file *f = vfs_open(notepad_filepath, O_RDONLY, 0);
+  if (!f)
+    return;
+
+  int bytes = vfs_read(f, notepad_text, NOTEPAD_MAX_TEXT - 1);
+  if (bytes >= 0) {
+    notepad_text[bytes] = '\0';
+    notepad_cursor = bytes;
+  }
+  vfs_close(f);
+}
+
+static void notepad_open_default(void) {
+  if (notepad_filepath[0]) {
+    notepad_load_file(notepad_filepath);
+    return;
+  }
+
+  const char *candidates[] = {
+      "/Desktop/notes.txt",
+      "/Desktop/readme.txt",
+      "/readme.txt",
+  };
+  for (int i = 0; i < 3; i++) {
+    struct file *f = vfs_open(candidates[i], O_RDONLY, 0);
+    if (f) {
+      vfs_close(f);
+      notepad_load_file(candidates[i]);
+      return;
     }
   }
 }
@@ -954,7 +1073,7 @@ static void image_viewer_on_mouse(struct window *win, int x, int y,
                                   int buttons);
 
 void gui_open_image_viewer(const char *path);
-static void gui_play_mp3_file(const char *path);
+void gui_play_mp3_file(const char *path);
 
 /* Context for finding clicked item */
 struct find_ctx {
@@ -1316,59 +1435,7 @@ static void fm_on_mouse(struct window *win, int x, int y, int buttons) {
     }
     full_path[idx] = '\0';
 
-    if (str_ends_with_ci(st->selected, ".txt")) {
-      gui_open_notepad(full_path);
-    } else if (str_ends_with_ci(st->selected, ".jpg") ||
-               str_ends_with_ci(st->selected, ".jpeg") ||
-               str_ends_with_ci(st->selected, ".png") ||
-               str_ends_with_ci(st->selected, ".bmp")) {
-      gui_open_image_viewer(full_path);
-    } else if (str_ends_with_ci(st->selected, ".mp3")) {
-      gui_play_mp3_file(full_path);
-    } else if (str_ends_with_ci(st->selected, ".py") ||
-               str_ends_with_ci(st->selected, ".nano")) {
-      /* Python/NanoLang file - open new terminal and run it */
-      extern struct terminal *term_create(int x, int y, int cols, int rows);
-      extern void term_set_active(struct terminal * term);
-      extern void term_puts(struct terminal * term, const char *str);
-      extern void term_execute_command(struct terminal * term, const char *cmd);
-      extern void term_set_content_pos(struct terminal * t, int x, int y);
-
-      /* Stagger window positions */
-      static int term_spawn_x = 120;
-      static int term_spawn_y = 100;
-
-      struct window *term_win =
-          gui_create_window("Terminal", term_spawn_x, term_spawn_y, 500, 350);
-      if (term_win) {
-        /* Create terminal with position relative to window content area */
-        int content_x = term_spawn_x + BORDER_WIDTH;
-        int content_y = term_spawn_y + BORDER_WIDTH + TITLEBAR_HEIGHT;
-        struct terminal *term = term_create(content_x, content_y, 60, 18);
-        if (term) {
-          /* Store terminal in window and set as active */
-          term_win->userdata = term;
-          term_set_active(term);
-          term_set_content_pos(term, content_x, content_y);
-
-          /* Build run command */
-          char run_cmd[300] = "run ";
-          int j = 4;
-          for (int i = 0; full_path[i] && j < 298; i++) {
-            run_cmd[j++] = full_path[i];
-          }
-          run_cmd[j] = '\0';
-          /* Execute the run command */
-          term_execute_command(term, run_cmd);
-          term_puts(term, "\n\033[32mroot@dunit\033[0m:\033[34m~\033[0m# ");
-        }
-      }
-
-      /* Stagger next window */
-      term_spawn_x = (term_spawn_x + 40) % 300 + 80;
-      term_spawn_y = (term_spawn_y + 35) % 200 + 70;
-    } else {
-      /* Directory - Navigate if it's a dir */
+    if (gui_file_type(full_path) == GUI_FILE_DIRECTORY) {
       struct file *entry = vfs_open(full_path, O_RDONLY, 0);
       if (entry && entry->f_dentry && entry->f_dentry->d_inode &&
           S_ISDIR(entry->f_dentry->d_inode->i_mode)) {
@@ -1387,6 +1454,8 @@ static void fm_on_mouse(struct window *win, int x, int y, int buttons) {
       }
       if (entry)
         vfs_close(entry);
+    } else {
+      gui_open_path(full_path);
     }
   }
 }
@@ -1566,7 +1635,7 @@ void gui_open_image_viewer(const char *path) {
   }
 }
 
-static void gui_play_mp3_file(const char *path) {
+void gui_play_mp3_file(const char *path) {
   if (!path)
     return;
 
@@ -2224,53 +2293,95 @@ static void draw_window(struct window *win) {
     gui_draw_rect(content_x + 5, text_area_y + 1, gutter_w - 2, text_area_h - 2,
                   0x252526);
 
+    char *target_text = (win->title[0] == 'N') ? notepad_text : rename_text;
+    int target_cursor = (win->title[0] == 'N') ? notepad_cursor : rename_cursor;
+    int first_visible_line = (win->title[0] == 'N') ? notepad_scroll_line : 0;
+
     /* Draw line numbers */
-    int line_num = 1;
     int max_lines = (text_area_h - 8) / 16;
     for (int i = 0; i < max_lines && i < 20; i++) {
-      char num_str[4] = {0};
-      int n = line_num + i;
-      if (n < 10) {
-        num_str[0] = '0' + n;
-      } else {
-        num_str[0] = '0' + (n / 10);
-        num_str[1] = '0' + (n % 10);
-      }
-      gui_draw_string(content_x + 20, text_area_y + 4 + i * 16, num_str,
-                      0x858585, 0x252526);
+      char num_str[8] = {0};
+      int n = first_visible_line + i + 1;
+      int pos = 0;
+      if (n >= 1000)
+        num_str[pos++] = '0' + (n / 1000) % 10;
+      if (n >= 100)
+        num_str[pos++] = '0' + (n / 100) % 10;
+      if (n >= 10)
+        num_str[pos++] = '0' + (n / 10) % 10;
+      num_str[pos++] = '0' + n % 10;
+      num_str[pos] = '\0';
+
+      int tx_num = content_x + 30;
+      if (n >= 10)
+        tx_num -= 8;
+      if (n >= 100)
+        tx_num -= 8;
+      if (n >= 1000)
+        tx_num -= 8;
+      gui_draw_string(tx_num, text_area_y + 4 + i * 16, num_str, 0x858585,
+                      0x252526);
+    }
+
+    int total_lines = 1;
+    for (int i = 0; target_text[i]; i++) {
+      if (target_text[i] == '\n')
+        total_lines++;
+    }
+    int max_scroll = total_lines - max_lines;
+    if (max_scroll < 0)
+      max_scroll = 0;
+    if (win->title[0] == 'N' && notepad_scroll_line > max_scroll) {
+      notepad_scroll_line = max_scroll;
+      first_visible_line = notepad_scroll_line;
     }
 
     /* Draw text with syntax-like highlighting */
-    int tx = content_x + 8 + gutter_w;
+    int base_tx = content_x + 8 + gutter_w;
+    int tx = base_tx;
     int ty = text_area_y + 4;
     int max_x = content_x + content_w - 12;
     int max_y = text_area_y + text_area_h - 8;
 
-    char *target_text = (win->title[0] == 'N') ? notepad_text : rename_text;
-    int target_cursor = (win->title[0] == 'N') ? notepad_cursor : rename_cursor;
-
     int char_count = 0;
     int line_count = 1;
-    for (int i = 0; i < target_cursor && ty < max_y; i++) {
+    int source_line = 0;
+    int cursor_x = base_tx;
+    int cursor_y = text_area_y + 4;
+    int cursor_visible_in_view = (first_visible_line == 0);
+
+    for (int i = 0; i < target_cursor; i++) {
       char c = target_text[i];
+      int visible_line = source_line - first_visible_line;
+
       if (c == '\n') {
-        tx = content_x + 8 + gutter_w;
-        ty += 16;
+        source_line++;
         line_count++;
-      } else {
+        if (source_line >= first_visible_line) {
+          tx = base_tx;
+          ty = text_area_y + 4 + (source_line - first_visible_line) * 16;
+        }
+      } else if (source_line >= first_visible_line && ty < max_y) {
         gui_draw_char(tx, ty, c, 0xD4D4D4, 0x1E1E1E);
         tx += 8;
         char_count++;
         if (tx >= max_x) {
-          tx = content_x + 8 + gutter_w;
+          tx = base_tx;
           ty += 16;
         }
+      }
+
+      if (i == target_cursor - 1) {
+        visible_line = source_line - first_visible_line;
+        cursor_visible_in_view = visible_line >= 0 && ty < max_y;
+        cursor_x = tx;
+        cursor_y = ty;
       }
     }
 
     /* Cursor with blink effect */
-    if (win->focused) {
-      gui_draw_rect(tx, ty, 2, 14, 0x569CD6);
+    if (win->focused && cursor_visible_in_view) {
+      gui_draw_rect(cursor_x, cursor_y, 2, 14, 0x569CD6);
     }
 
     /* Status bar */
@@ -2833,7 +2944,8 @@ static void draw_icon_web(int x, int y, int size) {
 
 /* Draw dock with hover animations - using vector icons */
 static void draw_dock(void) {
-  int mouse_active = (mouse_y >= primary_display.height - DOCK_HEIGHT - 40);
+  int mouse_active =
+      (mouse_y >= (int)primary_display.height - DOCK_HEIGHT - 40);
 
   /* 1. Calculate target sizes for all icons based on magnification */
   int icon_sizes[NUM_DOCK_ICONS];
@@ -2891,7 +3003,6 @@ static void draw_dock(void) {
     if (i < NUM_DOCK_ICONS - 1)
       total_content_w += DOCK_PADDING;
   }
-  int dock_content_w = total_content_w; /* Used by old code too */
   int dock_w = total_content_w + 32;    /* Padding */
   int dock_h = DOCK_HEIGHT - 12;
   int dock_x = (primary_display.width - dock_w) / 2;
@@ -2994,8 +3105,6 @@ static void draw_dock(void) {
   }
 }
 
-/* Cached wallpaper for performance - gradient is expensive to recalculate */
-static uint32_t *cached_wallpaper = NULL;
 static int wallpaper_cached = 0;
 static int wallpaper_cached_idx = -1; /* Which wallpaper is cached */
 
@@ -3427,11 +3536,11 @@ static int resize_start_win_x = 0, resize_start_win_y = 0;
 #define MIN_WINDOW_HEIGHT 100
 
 void gui_handle_mouse_event(int x, int y, int buttons) {
-  int prev_x = mouse_x;
-  int prev_y = mouse_y;
   mouse_x = x;
   mouse_y = y;
 
+  int wheel_up = buttons & 0x10;
+  int wheel_down = buttons & 0x20;
   int left_click = (buttons & 1) && !(prev_buttons & 1); /* Just pressed */
   int left_held = (buttons & 1);
   int left_release = !(buttons & 1) && (prev_buttons & 1);
@@ -3449,7 +3558,6 @@ void gui_handle_mouse_event(int x, int y, int buttons) {
 
   /* Track for double-click detection */
   static int last_click_x = 0, last_click_y = 0;
-  static uint64_t last_click_time = 0;
   static int click_count = 0;
 
   /* Handle window dragging */
@@ -3535,6 +3643,33 @@ void gui_handle_mouse_event(int x, int y, int buttons) {
   }
 
   prev_buttons = buttons;
+
+  if (wheel_up || wheel_down) {
+    int lines = wheel_up ? 3 : -3;
+    for (struct window *win = window_stack; win; win = win->next) {
+      if (!win->visible)
+        continue;
+      if (x >= win->x && x < win->x + win->width && y >= win->y &&
+          y < win->y + win->height) {
+        if (win->title[0] == 'T' && win->title[1] == 'e' &&
+            win->title[2] == 'r') {
+          struct terminal *term = (struct terminal *)win->userdata;
+          if (!term)
+            term = term_get_active();
+          term_scroll_lines(term, lines);
+          gui_request_redraw();
+          return;
+        }
+
+        if (win->on_mouse) {
+          win->on_mouse(win, x - win->x, y - win->y, buttons);
+          gui_request_redraw();
+          return;
+        }
+        return;
+      }
+    }
+  }
 
   /* Handle desktop right-click (context menu) - check BEFORE left_click gate */
   if (right_click) {
@@ -3957,7 +4092,6 @@ void gui_handle_mouse_event(int x, int y, int buttons) {
           break;
         case 3: /* Notepad */
           /* Call open with NULL to just open blank */
-          extern void gui_open_notepad(const char *path);
           gui_open_notepad(NULL);
           break;
         case 4: /* Settings */
@@ -4205,35 +4339,75 @@ struct window *gui_create_file_manager_path(int x, int y, const char *path) {
 }
 
 static void notepad_on_mouse(struct window *win, int x, int y, int buttons) {
+  if (buttons & 0x30) {
+    int total_lines = 1;
+    for (int i = 0; notepad_text[i]; i++) {
+      if (notepad_text[i] == '\n')
+        total_lines++;
+    }
+
+    int content_h = win->height - BORDER_WIDTH * 2 - TITLEBAR_HEIGHT;
+    int toolbar_h = 36;
+    int status_h = 22;
+    int text_area_h = content_h - toolbar_h - status_h - 4;
+    int visible_lines = (text_area_h - 8) / 16;
+    int max_scroll = total_lines - visible_lines;
+    if (max_scroll < 0)
+      max_scroll = 0;
+
+    if (buttons & 0x10)
+      notepad_scroll_line -= 3;
+    if (buttons & 0x20)
+      notepad_scroll_line += 3;
+    if (notepad_scroll_line < 0)
+      notepad_scroll_line = 0;
+    if (notepad_scroll_line > max_scroll)
+      notepad_scroll_line = max_scroll;
+    return;
+  }
+
   /* Check Save Button */
   /* Toolbar area */
   int content_y = BORDER_WIDTH + TITLEBAR_HEIGHT;
-  if (y >= content_y && y < content_y + 30) {
-    if (x >= BORDER_WIDTH + 10 && x < BORDER_WIDTH + 70) {
-      /* Save clicked */
-      if (notepad_filepath[0]) {
-        /* Open for writing */
-        struct file *f = vfs_open(notepad_filepath, O_RDWR | O_CREAT, 0644);
-        if (f) {
-          /* Determine length */
-          int len = 0;
-          while (notepad_text[len] && len < NOTEPAD_MAX_TEXT)
-            len++;
+  int btn_y = content_y + 6;
+  int btn_h = 24;
+  if (y >= btn_y && y < btn_y + btn_h) {
+    int btn_spacing = 4;
+    int bx = BORDER_WIDTH + 8;
 
-          /* Write content */
-          extern ssize_t vfs_write(struct file * file, const char *buf,
-                                   size_t count);
-          vfs_write(f, notepad_text, len);
-          /* Reset file position if we want to ensure we wrote from start?
-           * vfs_open sets pos 0. */
+    if (x >= bx && x < bx + 50) {
+      notepad_new_file();
+      return;
+    }
+    bx += 50 + btn_spacing;
 
-          /* Hack: Force truncation in ramfs? For now just overwrite. */
+    if (x >= bx && x < bx + 50) {
+      notepad_open_default();
+      return;
+    }
+    bx += 50 + btn_spacing;
 
-          vfs_close(f);
+    if (x >= bx && x < bx + 50) {
+      notepad_save_file();
+      return;
+    }
+    bx += 50 + btn_spacing + 8 + 1 + 12;
 
-          printk("Notepad: Saved %d bytes to %s\n", len, notepad_filepath);
-        }
-      }
+    if (x >= bx && x < bx + 42) {
+      notepad_cut_all();
+      return;
+    }
+    bx += 42 + btn_spacing;
+
+    if (x >= bx && x < bx + 50) {
+      notepad_copy_all();
+      return;
+    }
+    bx += 50 + btn_spacing;
+
+    if (x >= bx && x < bx + 55) {
+      notepad_paste();
+      return;
     }
   }
 }
@@ -4242,6 +4416,7 @@ void gui_open_notepad(const char *path) {
   /* Clear existing state */
   notepad_text[0] = '\0';
   notepad_cursor = 0;
+  notepad_scroll_line = 0;
   notepad_filepath[0] = '\0';
 
   if (path) {
@@ -4276,6 +4451,8 @@ void gui_open_notepad(const char *path) {
 }
 
 static void rename_on_mouse(struct window *win, int x, int y, int buttons) {
+  (void)buttons;
+
   /* Check Save Button */
   int content_y = BORDER_WIDTH + TITLEBAR_HEIGHT;
   if (y >= content_y && y < content_y + 30) {
@@ -4671,10 +4848,6 @@ static void image_viewer_on_draw(struct window *win) {
   int btn_y = tb_y + (tb_h - btn_size) / 2;
   int btn_x = tb_x + 16;
 
-  /* Button icons (using ASCII for now) */
-  const char *icons[] = {"<", ">", "R", "L", "+", "-", "F", "X"};
-  const char *labels[] = {"Prev",  "Next",  "Rot R", "Rot L",
-                          "Zoom+", "Zoom-", "Fit",   "Full"};
   uint32_t btn_bg = 0x374151;
   uint32_t btn_hover = 0x4B5563;
   uint32_t icon_color = 0xE5E7EB;
@@ -4767,7 +4940,7 @@ static void image_viewer_on_draw(struct window *win) {
     if (rot >= 10)
       info[idx++] = '0' + (rot / 10) % 10;
     info[idx++] = '0' + rot % 10;
-    info[idx++] = 176; /* degree symbol approximation */
+    info[idx++] = '*'; /* degree symbol approximation */
   }
   info[idx] = '\0';
 

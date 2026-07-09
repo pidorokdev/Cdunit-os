@@ -34,10 +34,13 @@ void gui_draw_string(int x, int y, const char *str, uint32_t fg, uint32_t bg);
 
 /* Input */
 void gui_handle_mouse_event(int x, int y, int buttons);
-void gui_handle_key_event(int keycode, bool pressed);
+void gui_handle_key_event(int keycode);
 void gui_move_mouse(int dx, int dy);
 void gui_draw_cursor(void);
+struct window *gui_create_file_manager_path(int x, int y, const char *path);
 void gui_open_image_viewer(const char *path);
+void gui_open_notepad(const char *path);
+int gui_open_path(const char *path);
 
 /* ===================================================================== */
 /* Terminal */
@@ -51,6 +54,7 @@ void term_putc(struct terminal *term, char c);
 void term_puts(struct terminal *term, const char *str);
 void term_render(struct terminal *term);
 void term_handle_key(struct terminal *term, int key);
+void term_scroll_lines(struct terminal *term, int lines);
 struct terminal *term_get_active(void);
 void term_set_active(struct terminal *term);
 

@@ -2,13 +2,22 @@
 # Builds doomgeneric as a Dunit OS userspace program
 
 # Toolchain - Use LLVM/Clang like the kernel build
-LLVM_PATH := /opt/homebrew/opt/llvm/bin
-BREW_PATH := /opt/homebrew/bin
+UNAME_S := $(shell uname -s)
+ARCH ?= x86_64
 
+ifeq ($(UNAME_S),Darwin)
+LLVM_PATH ?= /opt/homebrew/opt/llvm/bin
+BREW_PATH ?= /opt/homebrew/bin
 CC := $(LLVM_PATH)/clang
 AS := $(LLVM_PATH)/clang
 LD := $(BREW_PATH)/ld.lld
 OBJCOPY := $(LLVM_PATH)/llvm-objcopy
+else
+CC := clang
+AS := clang
+LD := ld.lld
+OBJCOPY := llvm-objcopy
+endif
 
 # Directories (updated for Dunit OS structure)
 DOOM_SRC = doomgeneric/doomgeneric
@@ -18,9 +27,23 @@ BUILD_DIR = build
 # Output
 TARGET = $(BUILD_DIR)/doom
 
-# Compiler flags for ARM64 freestanding
-CFLAGS = --target=aarch64-unknown-none-elf -ffreestanding -nostdlib -nostdinc \
-         -mcpu=cortex-a72 -fPIE -O0 \
+ifeq ($(ARCH),arm64)
+CROSS_TARGET := --target=aarch64-unknown-none-elf
+ARCH_CFLAGS := -mcpu=cortex-a72
+LINKER_SCRIPT := ../../linker.ld
+ENTRY_OBJ := $(BUILD_DIR)/crt0.o
+else ifeq ($(ARCH),x86_64)
+CROSS_TARGET := --target=x86_64-unknown-none-elf
+ARCH_CFLAGS := -mno-red-zone
+LINKER_SCRIPT := ../../linker_x86_64.ld
+ENTRY_OBJ :=
+else
+$(error Unsupported DOOM architecture: $(ARCH). Use arm64 or x86_64)
+endif
+
+# Compiler flags for freestanding userspace
+CFLAGS = $(CROSS_TARGET) -ffreestanding -nostdlib -nostdinc \
+         -fno-stack-protector -fno-builtin -fPIE -O0 $(ARCH_CFLAGS) \
          -Wall -Wno-unused-variable -Wno-unused-function \
          -Wno-unused-but-set-variable -Wno-sometimes-uninitialized \
          -Wno-error -w \
@@ -28,10 +51,10 @@ CFLAGS = --target=aarch64-unknown-none-elf -ffreestanding -nostdlib -nostdinc \
          -include doom_libc.h
 
 # Assembler flags
-ASFLAGS = --target=aarch64-unknown-none-elf -mcpu=cortex-a72
+ASFLAGS = $(CROSS_TARGET) $(ARCH_CFLAGS)
 
 # Linker flags (fixed path)
-LDFLAGS = -pie -T ../../linker.ld
+LDFLAGS = -pie -T $(LINKER_SCRIPT)
 
 # Files to exclude (platform-specific and sound)
 EXCLUDE_FILES = \
@@ -65,14 +88,14 @@ DOOM_SRCS = $(filter-out $(addprefix $(DOOM_SRC)/,$(EXCLUDE_FILES)),$(ALL_DOOM_S
 DOOM_OBJS = $(patsubst $(DOOM_SRC)/%.c,$(BUILD_DIR)/doom_%.o,$(DOOM_SRCS))
 
 # Local source files
-LOCAL_SRCS = doomgeneric_dunitos.c doom_libc.c
+LOCAL_SRCS = doomgeneric_vibeos.c doom_libc.c
 LOCAL_OBJS = $(patsubst %.c,$(BUILD_DIR)/%.o,$(LOCAL_SRCS))
 
 # CRT object
 CRT_OBJ = $(BUILD_DIR)/crt0.o
 
 # All objects
-ALL_OBJS = $(CRT_OBJ) $(LOCAL_OBJS) $(DOOM_OBJS)
+ALL_OBJS = $(ENTRY_OBJ) $(LOCAL_OBJS) $(DOOM_OBJS)
 
 .PHONY: all clean
 

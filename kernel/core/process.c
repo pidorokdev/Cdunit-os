@@ -170,26 +170,30 @@ int process_create(const char *path, int argc, char **argv) {
     printf("[PROC] No free process slots\n");
     return -1;
   }
-  // Reserve the slot immediately
-  proc_table[slot].state = PROC_STATE_READY;
-  proc_table[slot].pid = next_pid++;
+  // Reserve the slot immediately, but do not let the scheduler run it until
+  // the ELF, stack and initial CPU context are fully initialized.
+  process_t *proc = &proc_table[slot];
+  proc->state = PROC_STATE_BLOCKED;
   spin_unlock_irqrestore(&proc_table_lock, flags);
 
   // Look up file
   vfs_node_t *file = vfs_lookup(path);
   if (!file) {
     printf("[PROC] File not found: %s\n", path);
+    proc->state = PROC_STATE_FREE;
     return -1;
   }
 
   if (vfs_is_dir(file)) {
     printf("[PROC] Cannot exec directory: %s\n", path);
+    proc->state = PROC_STATE_FREE;
     return -1;
   }
 
   size_t size = file->size;
   if (size == 0) {
     printf("[PROC] File is empty: %s\n", path);
+    proc->state = PROC_STATE_FREE;
     return -1;
   }
 
@@ -197,6 +201,7 @@ int process_create(const char *path, int argc, char **argv) {
   char *data = malloc(size);
   if (!data) {
     printf("[PROC] Out of memory reading %s\n", path);
+    proc->state = PROC_STATE_FREE;
     return -1;
   }
 
@@ -204,6 +209,7 @@ int process_create(const char *path, int argc, char **argv) {
   if (bytes != (int)size) {
     printf("[PROC] Failed to read %s\n", path);
     free(data);
+    proc->state = PROC_STATE_FREE;
     return -1;
   }
 
@@ -216,6 +222,7 @@ int process_create(const char *path, int argc, char **argv) {
     printf("[PROC] Header: %02x %02x %02x %02x %02x %02x %02x %02x\n", b[0],
            b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
     free(data);
+    proc->state = PROC_STATE_FREE;
     return -1;
   }
 
@@ -228,6 +235,7 @@ int process_create(const char *path, int argc, char **argv) {
   if (elf_load_at(data, size, load_addr, &info) != 0) {
     printf("[PROC] Failed to load ELF: %s\n", path);
     free(data);
+    proc->state = PROC_STATE_FREE;
     return -1;
   }
 
@@ -237,11 +245,9 @@ int process_create(const char *path, int argc, char **argv) {
   next_load_addr = ALIGN_64K(load_addr + info.load_size + 0x10000);
 
   // Set up process structure
-  process_t *proc = &proc_table[slot];
   proc->pid = next_pid++;
   strncpy(proc->name, path, PROCESS_NAME_MAX - 1);
   proc->name[PROCESS_NAME_MAX - 1] = '\0';
-  proc->state = PROC_STATE_READY;
   proc->load_base = info.load_base;
   proc->load_size = info.load_size;
   proc->entry = info.entry;
@@ -288,6 +294,8 @@ int process_create(const char *path, int argc, char **argv) {
   arch_context_set_flags(&proc->context, 0x202); // IF (interrupts enabled)
   // x86 32-bit: pass via stack or registers (TBD)
 #endif
+
+  proc->state = PROC_STATE_READY;
 
   // printf("[PROC] Created process '%s' pid=%d at 0x%lx-0x%lx (slot %d)\n",
   //        proc->name, proc->pid, proc->load_base, proc->load_base +

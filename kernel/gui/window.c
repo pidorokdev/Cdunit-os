@@ -4100,48 +4100,26 @@ void gui_handle_mouse_event(int x, int y, int buttons) {
         case 5: /* Clock */
           gui_create_window("Clock", spawn_x + 50, spawn_y + 40, 260, 200);
           break;
-        case 6: /* DOOM - Direct call test */
+        case 6: /* DOOM */
         {
-          printk("GUI: Direct DOOM call test...\n");
-          extern void *vfs_lookup(const char *path);
-          extern int vfs_read_compat(void *node, void *buf, unsigned int size,
-                                     unsigned int offset);
-          extern int elf_load_at(void *data, unsigned int size,
-                                 uint64_t load_addr, void *info);
+          extern int process_create(const char *path, int argc, char **argv);
+          extern int process_start(int pid);
+          extern void process_schedule(void);
 
-          extern void *kapi_get(void);
-
-          void *file = vfs_lookup("/bin/doom");
-          if (!file) {
-            printk("DOOM not found\n");
+          static char *doom_argv[] = {"/bin/doom", 0};
+          int pid = process_create("/bin/doom", 1, doom_argv);
+          if (pid < 0) {
+            printk("GUI: failed to create DOOM process\n");
             break;
           }
 
-          char *data = kmalloc(900000);
-          int bytes = vfs_read_compat(file, data, 900000, 0);
-          printk("Read %d bytes\n", bytes);
-
-          typedef struct {
-            uint64_t entry;
-            uint64_t load_base;
-            uint64_t load_size;
-          } elf_info_t;
-          elf_info_t info = {0};
-          if (elf_load_at(data, bytes, 0x44000000, &info) != 0) {
-            printk("ELF load failed\n");
-            kfree(data);
+          if (process_start(pid) != 0) {
+            printk("GUI: failed to start DOOM process %d\n", pid);
             break;
           }
-          kfree(data);
-          printk("Entry at 0x%llx\n", info.entry);
 
-          typedef int (*entry_t)(void *, int, char **);
-          entry_t doom_main = (entry_t)info.entry;
-          void *api = kapi_get();
-          char *argv[] = {"/bin/doom", 0};
-          printk("Calling DOOM directly at 0x%llx...\n", (uint64_t)doom_main);
-          int ret = doom_main(api, 1, argv);
-          printk("DOOM returned %d\n", ret);
+          printk("GUI: started DOOM process %d\n", pid);
+          process_schedule();
         } break;
         case 7: /* Snake */
         {

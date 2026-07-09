@@ -45,10 +45,21 @@ int elf_validate(const void *data, size_t size) {
     return -4;
   }
 
-  /* Check machine type (AArch64) */
+#if defined(ARCH_ARM64)
   if (ehdr->e_machine != EM_AARCH64) {
     return -5;
   }
+#elif defined(ARCH_X86_64)
+  if (ehdr->e_machine != EM_X86_64) {
+    return -5;
+  }
+#elif defined(ARCH_X86)
+  if (ehdr->e_machine != EM_386) {
+    return -5;
+  }
+#else
+  return -5;
+#endif
 
   /* Check type (executable or PIE) */
   if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN) {
@@ -129,7 +140,16 @@ static void elf_process_relocations(uint64_t load_base,
     uint64_t type = rela[i].r_info & 0xFFFFFFFF;
     int64_t addend = rela[i].r_addend;
 
-    if (type == R_AARCH64_RELATIVE) {
+    int is_relative = 0;
+#if defined(ARCH_ARM64)
+    is_relative = (type == R_AARCH64_RELATIVE);
+#elif defined(ARCH_X86_64)
+    is_relative = (type == R_X86_64_RELATIVE);
+#elif defined(ARCH_X86)
+    is_relative = (type == R_386_RELATIVE);
+#endif
+
+    if (is_relative) {
       uint64_t *target = (uint64_t *)(load_base + offset);
       *target = load_base + addend;
     } else {

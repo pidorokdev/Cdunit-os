@@ -331,6 +331,9 @@ int main(kapi_t *api, int argc, char **argv) {
 
 #include "i_sound.h"
 
+int snd_musicdevice = SNDDEVICE_NONE;
+int snd_sfxdevice = SNDDEVICE_NONE;
+
 void I_InitSound(boolean use_sfx_prefix) {
     (void)use_sfx_prefix;
     if (doom_kapi) {
@@ -357,21 +360,9 @@ void I_UpdateSoundParams(int channel, int vol, int sep) {
 
 /* Rudimentary single-channel playback for testing */
 int I_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep) {
-    if (!doom_kapi || !sfxinfo) return -1;
-    
-    /* Just log for now */
-    // char buf[64];
-    // sprintf(buf, "Play Sound: %s vol=%d\n", sfxinfo->name, vol);
-    // doom_kapi->puts(buf);
-    
-    /* If we had data, we'd send it */
-    if (sfxinfo->data) {
-        /* Doom sounds are 8-bit mono, usually 11025Hz */
-        /* Skip header if present (PCFX) - usually 8 bytes? varies */
-        /* For simplicity, send a small chunk to prove connectivity */
-        doom_kapi->sound_play_pcm_async(sfxinfo->data, 100, 1, 11025);
-    }
-    
+    (void)sfxinfo;
+    (void)vol;
+    (void)sep;
     return channel;
 }
 

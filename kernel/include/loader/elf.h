@@ -66,7 +66,9 @@ typedef struct {
     int64_t  r_addend;
 } Elf64_Rela;
 
-/* Relocation types for AArch64 */
+/* Relative relocation types */
+#define R_386_RELATIVE     8
+#define R_X86_64_RELATIVE  8
 #define R_AARCH64_RELATIVE 0x403
 
 /* ELF identification indices */
@@ -84,6 +86,8 @@ typedef struct {
 #define ELFDATA2LSB 1  /* Little endian */
 
 /* Machine types */
+#define EM_386     3
+#define EM_X86_64  62
 #define EM_AARCH64 183
 
 /* ELF types */
